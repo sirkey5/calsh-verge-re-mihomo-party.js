@@ -2,9 +2,9 @@ clash verge re&mihomo party全局覆写，懒人一键全自动脚本
 
 给Clash-Verge-Rev和Mihomo-Party做的全自动智能脚本，复制粘贴或者导入即可，不需要任何额外人工操作
 
-引用自https://github.com/dahaha-365/YaNet/，进行了相关代码重构
+引用自https://github.com/dahaha-365/YaNet/
 
-感谢dahaha-365的源代码技术
+感谢dahaha-365的源代码技术，，进行了相关源代码重构
 
 功能简介：
 
