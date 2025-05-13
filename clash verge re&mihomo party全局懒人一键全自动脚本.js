@@ -249,36 +249,7 @@ function getEvalInterval(node) {
   return Math.min(BASE_EVAL_INTERVAL * Math.pow(2, Math.abs(score)), MAX_EVAL_INTERVAL);
 }
 
-async function evaluateNodeQuality(node) {
-  const now = Date.now();
-  const nextEval = nodeNextEvalTime.get(node) || 0;
-  if (now < nextEval) return; // 未到评估时间
-  const metrics = await testNodeMultiMetrics(node);
-  let status = 'normal';
-  if (metrics.loss < 0.1 && metrics.latency < 200) status = 'good';
-  else if (metrics.loss > 0.4 || metrics.latency > 800) status = 'bad';
-  nodeQualityStatus.set(node, status);
-  // 连续优/劣次数统计
-  let score = nodeQualityScore.get(node) || 0;
-  if (status === 'good') score = score > 0 ? score + 1 : 1;
-  else if (status === 'bad') score = score < 0 ? score - 1 : -1;
-  else score = 0;
-  nodeQualityScore.set(node, score);
-  // 下次评估时间自适应
-  nodeNextEvalTime.set(node, now + getEvalInterval(node));
-}
 
-async function periodicEvaluateAllNodes(nodes) {
-  await Promise.all(nodes.map(evaluateNodeQuality));
-}
-
-// ========== 优先权重选择逻辑增强 ========== 
-function getNodePriorityWeight(node) {
-  const status = nodeQualityStatus.get(node) || 'normal';
-  if (status === 'good') return 10 + Math.abs(nodeQualityScore.get(node) || 0); // 优质节点大权重
-  if (status === 'bad') return 1 / (1 + Math.abs(nodeQualityScore.get(node) || 0)); // 劣质节点极低权重
-  return 1;
-}
 
 async function selectBestNodeWithQuality(nodes) {
   await periodicEvaluateAllNodes(nodes);
@@ -1921,14 +1892,41 @@ function predictNodeAnomaly(node) {
 
 // 智能学习流程中集成预测结果
 async function learnAndUpdateNodeProfile() {
-  for (const [node, records] of nodeProfileDB.entries()) {
-    const pred = predictNodeFuturePerformance(node);
-    // 可将预测结果用于动态调整分流表、优先级、预警等
-    if (pred.risk > 0.7) {
-      // 高风险节点可降低分流优先级或标记为待观察
-      nodeDispatchTable.forEach((v, k) => { if (v === node) nodeDispatchTable.delete(k); });
+  try {
+    for (const [node, records] of nodeProfileDB.entries()) {
+      const pred = predictNodeFuturePerformance(node);
+
+      if (pred.risk > 0.95) {
+        nodeManager.eliminateNode(node);
+        continue;
+      }
+
+      const avgScore = records.reduce((a, b) => a + (b.aiScore || 0), 0) / (records.length || 1);
+      if (avgScore < -500) {
+        nodeManager.eliminateNode(node);
+        continue;
+      }
+
+      const latencies = records.map(r => r.latency).filter(Boolean);
+      if (latencies.length > 10) {
+        const mean = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+        const variance = latencies.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / latencies.length;
+        if (variance > 1000000) {
+          nodeManager.eliminateNode(node);
+          continue;
+        }
+      }
+
+      if (records.slice(-5).filter(r => r.loss > 0.5 || r.latency > 2000).length >= 5) {
+        nodeManager.eliminateNode(node);
+        continue;
+      }
     }
-    // ...可扩展更多预测驱动的管理逻辑...
+
+    // 清理过期节点
+    nodeManager.cleanupExpiredNodes();
+  } catch (error) {
+    console.error('学习和更新节点配置失败:', error);
   }
 }
 
@@ -1949,28 +1947,41 @@ async function smartDispatchNode(user, nodes, context = {}) {
 
 // ========== 节点全自动切换与分流主流程优化 ==========
 async function handleProxyRequest(user, ...args) {
-  let currentNode = getCurrentNodeForUser(user);
-  const allNodes = getAllAvailableNodesForUser(user);
-  // 分流优先，AI预测驱动
-  const newNode = await smartDispatchNode(user, allNodes, { /* 可扩展context */ });
-  if (newNode !== currentNode) {
-    setCurrentNodeForUser(user, newNode);
+  try {
+    let currentNode = nodeManager.getNodeDispatch(user);
+    const allNodes = getAllAvailableNodesForUser(user);
+
+    // 分流优先，AI预测驱动
+    const newNode = await smartDispatchNode(user, allNodes, { /* 可扩展context */ });
+
+    if (newNode !== currentNode) {
+      nodeManager.updateNodeDispatch(user, newNode);
+    }
+
+    // 采集本次请求的多维度数据
+    const metrics = await testNodeMultiMetrics(newNode);
+    if (newNode.ip) {
+      metrics.geo = await getNodeGeoInfo(newNode.ip);
+    }
+
+    // 记录节点请求指标
+    recordNodeRequestMetrics(newNode, metrics);
+
+    // 定期自学习与分流表动态调整
+    if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
+
+    // 节点异常自动降级，恢复后自动提升
+    if (predictNodeAnomaly(newNode) > 0.7) {
+      nodeManager.updateNodeHealth(newNode, 'bad');
+    } else if (predictNodeAnomaly(newNode) < 0.2) {
+      nodeManager.updateNodeHealth(newNode, 'good');
+    }
+
+    return proxyRequestWithNode(newNode, ...args);
+  } catch (error) {
+    console.error('代理请求处理失败:', error);
+    return proxyRequestWithNode(currentNode || '直连', ...args);
   }
-  // 采集本次请求的多维度数据
-  const metrics = await testNodeMultiMetrics(newNode);
-  if (newNode.ip) {
-    metrics.geo = await getNodeGeoInfo(newNode.ip);
-  }
-  await recordNodeRequestMetrics(newNode, metrics);
-  // 定期自学习与分流表动态调整
-  if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
-  // 节点异常自动降级，恢复后自动提升
-  if (predictNodeAnomaly(newNode) > 0.7) {
-    nodeQualityStatus.set(newNode, 'bad');
-  } else if (predictNodeAnomaly(newNode) < 0.2) {
-    nodeQualityStatus.set(newNode, 'good');
-  }
-  return proxyRequestWithNode(newNode, ...args);
 }
 
 // ========== AI数据持久化与六维淘汰机制增强（兼容SubStore/浏览器） ========== 
