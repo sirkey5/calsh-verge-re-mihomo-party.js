@@ -1,3 +1,8 @@
+// ========== 重要维护提示 ==========
+// 所有后续新增的变量、函数、类、常量等，必须在本文件中显式定义，严禁未定义直接调用，防止ReferenceError: not defined等运行时错误。
+// 如有跨文件依赖，需在本文件顶部或相关位置补充声明或导入。
+// ===================================
+
 /**
  * 整个脚本的总开关，在Mihomo Party使用的话，请保持为true
  * true = 启用
@@ -239,7 +244,7 @@ class CDN_CONFIG {
   }
 }
 
-// ========== 优质/劣质节点状态与评估周期管理 ==========
+// ========== 优质/劣质节点状态与评估周期管理 ========== 
 const nodeQualityStatus = new Map(); // {node: 'good'|'bad'|'normal'}
 const nodeQualityScore = new Map();  // {node: 连续优/劣次数}
 const nodeNextEvalTime = new Map();  // {node: 下次评估时间戳}
@@ -276,7 +281,7 @@ async function periodicEvaluateAllNodes(nodes) {
   await Promise.all(nodes.map(evaluateNodeQuality));
 }
 
-// ========== 优先权重选择逻辑增强 ==========
+// ========== 优先权重选择逻辑增强 ========== 
 function getNodePriorityWeight(node) {
   const status = nodeQualityStatus.get(node) || 'normal';
   if (status === 'good') return 10 + Math.abs(nodeQualityScore.get(node) || 0); // 优质节点大权重
@@ -300,7 +305,7 @@ async function selectBestNodeWithQuality(nodes) {
   return results[0].node;
 }
 
-// ========== 节点切换逻辑增强 ==========
+// ========== 节点切换逻辑增强 ========== 
 async function autoSwitchNodeIfNeededV2(currentNode, nodes) {
   const now = Date.now();
   if (nodeLastSwitch.get(currentNode) && now - nodeLastSwitch.get(currentNode) < 60000) return currentNode;
@@ -310,6 +315,37 @@ async function autoSwitchNodeIfNeededV2(currentNode, nodes) {
     // 可扩展：自动切换逻辑
   }
   return best;
+}
+
+// ========== 智能节点切换与冷却增强 ========== 
+const nodeSwitchCooldown = new Map(); // {node: 下次可切换时间戳}
+const BASE_SWITCH_COOLDOWN = 30 * 60 * 1000; // 30分钟
+const MAX_SWITCH_COOLDOWN = 24 * 60 * 60 * 1000; // 最长24小时
+
+function getSwitchCooldown(node) {
+  // 连续优质次数越多，冷却时间越长，指数增长
+  const score = nodeQualityScore.get(node) || 0;
+  return Math.min(BASE_SWITCH_COOLDOWN * Math.pow(2, Math.max(0, score - 1)), MAX_SWITCH_COOLDOWN);
+}
+
+async function smartAutoSwitchNode(currentNode, nodes) {
+  const now = Date.now();
+  // 冷却未到，直接返回当前节点
+  if (nodeSwitchCooldown.get(currentNode) && now < nodeSwitchCooldown.get(currentNode)) return currentNode;
+  // 每半小时评估一次是否有更优节点
+  await periodicEvaluateAllNodes(nodes);
+  const best = await selectBestNodeWithQuality(nodes);
+  if (best !== currentNode) {
+    // 切换到更优节点，重置冷却
+    const cooldown = getSwitchCooldown(best);
+    nodeSwitchCooldown.set(best, now + cooldown);
+    return best;
+  } else {
+    // 当前节点依然最优，延长冷却
+    const cooldown = getSwitchCooldown(currentNode);
+    nodeSwitchCooldown.set(currentNode, now + cooldown);
+    return currentNode;
+  }
 }
 
 // 智能分流调度核心
@@ -888,7 +924,7 @@ async function testNodeMultiMetrics(node) {
   return { latency, jitter, loss, bandwidth };
 }
 
-// =================== 节点分组地理聚类（可扩展） ===================
+// =================== 节点分组地理聚类（可扩展） =================== 
 function groupNodesByGeo(nodes, geoInfoMap) {
   // geoInfoMap: { nodeName: { lat, lon } }
   // 这里预留接口，实际聚类可用k-means等
@@ -896,7 +932,7 @@ function groupNodesByGeo(nodes, geoInfoMap) {
   return { 0: nodes };
 }
 
-// =================== 批量并发分组与优选（增强版） ===================
+// =================== 批量并发分组与优选（增强版） =================== 
 async function batchGroupAndSelect(nodes, geoInfoMap, historyCache) {
   // 地理聚类分组
   const groups = groupNodesByGeo(nodes, geoInfoMap);
@@ -914,10 +950,12 @@ async function batchGroupAndSelect(nodes, geoInfoMap, historyCache) {
     });
     return metricsList[0]?.node;
   }));
+  // 自动切换到最优节点
+  await autoUpdateCurrentNode(nodes);
   return bestNodes;
 }
 
-// =================== 批量并发测速与健康检查 ===================
+// =================== 批量并发测速与健康检查 =================== 
 async function batchTestNodes(nodes) {
   // 并发测速与健康检查，返回所有节点的多维度指标
   return await Promise.all(nodes.map(async node => {
@@ -926,7 +964,7 @@ async function batchTestNodes(nodes) {
   }));
 }
 
-// =================== 节点分流分配（增强版） ===================
+// =================== 节点分流分配（增强版） =================== 
 async function dynamicNodeAssignment(nodes, trafficStatsMap) {
   // 根据流量类型动态分配最优节点，优先优质节点
   const assignments = {};
@@ -943,7 +981,7 @@ async function dynamicNodeAssignment(nodes, trafficStatsMap) {
   return assignments;
 }
 
-// =================== 节点自愈与降级 ===================
+// =================== 节点自愈与降级 =================== 
 async function autoHealNodes(nodes, unhealthyNodes, cooldownMap, retryDelay = 60000) {
   // 对异常节点冷却后自动重试
   for (const node of unhealthyNodes) {
@@ -960,20 +998,22 @@ async function autoHealNodes(nodes, unhealthyNodes, cooldownMap, retryDelay = 60
   }
 }
 
-// =================== 节点批量预热与高频优先刷新 ===================
+// =================== 节点批量预热与高频优先刷新 =================== 
 async function preheatAndRefreshNodes(nodes, historyCache, threshold = 0.7) {
   // 高频节点优先预热
   const hotNodes = nodes.filter(n => (historyCache.get(n) || 0) > threshold);
   await Promise.all(hotNodes.map(n => testNodeMultiMetrics(n)));
+  // 自动切换到最优节点
+  await autoUpdateCurrentNode(nodes);
 }
 
-// =================== 节点流量模式识别（占位，防止未定义） ===================
+// =================== 节点流量模式识别（占位，防止未定义） =================== 
 function detectTrafficPattern(trafficStats) {
   // 可根据流量特征返回 'video' | 'game' | 'default' 等
   return 'default';
 }
 
-// =================== 节点AI/ML智能评分 ===================
+// =================== 节点AI/ML智能评分 =================== 
 function aiScoreNode({ latency, jitter, loss, bandwidth, history }) {
   // 可扩展为ML模型，这里用加权评分，分数越低越优
   const weights = { latency: 0.4, jitter: 0.15, loss: 0.25, bandwidth: 0.1, history: 0.1 };
@@ -981,12 +1021,12 @@ function aiScoreNode({ latency, jitter, loss, bandwidth, history }) {
     (latency || 1000) * weights.latency +
     (jitter || 0) * weights.jitter +
     (loss || 1) * 100 * weights.loss -
-    (bandwidth || 0) * weights.bandwidth -
+    (bandwidth || 0) * weights.bandwidth - 
     (history || 0) * 100 * weights.history
   );
 }
 
-// =================== 主入口main流程增强 ===================
+// =================== 主入口main流程增强 =================== 
 async function main(config) {
   const proxyCount = config?.proxies?.length ?? 0
   const proxyProviderCount =
@@ -1187,6 +1227,9 @@ async function main(config) {
     const best = await batchGroupAndSelect(otherProxyGroups, {}, nodeHistoryCache);
     otherProxyGroups = [best[0], ...otherProxyGroups.filter(n => n !== best[0])];
   }
+
+  // 自动切换到最优节点，无需外部调用
+  await autoUpdateCurrentNode(allNodes);
 
   config['proxy-groups'] = [
     {
@@ -1698,3 +1741,35 @@ async function selectBestNodeWithQuality(nodes) {
   // 简化实现，实际已在主逻辑定义
   return nodes[0];
 }
+
+// =================== 节点切换逻辑增强（主流程调用） =================== 
+// ========== 代理请求前驱动的智能节点切换集成 ========== 
+// 假设有一个代理请求/流量事件的入口函数 handleProxyRequest(user, ...)
+// 在每次请求前动态判断是否需要切换节点
+async function handleProxyRequest(user, ...args) {
+  // 获取当前用户的当前节点
+  let currentNode = getCurrentNodeForUser(user);
+  // 智能切换（无定时器，事件驱动）
+  const allNodes = getAllAvailableNodesForUser(user); // 需根据实际业务实现
+  const newNode = await smartAutoSwitchNode(currentNode, allNodes);
+  if (newNode !== currentNode) {
+    // 执行实际代理切换操作
+    setCurrentNodeForUser(user, newNode);
+    // 可选：记录切换日志
+  }
+  // 继续后续代理请求逻辑...
+  return proxyRequestWithNode(newNode, ...args);
+}
+
+// ========== 全自动节点切换辅助函数 ========== 
+async function autoUpdateCurrentNode(allNodes) {
+  // 智能切换，自动更新全局currentNode
+  const newNode = await smartAutoSwitchNode(currentNode, allNodes);
+  if (newNode !== currentNode) {
+    currentNode = newNode;
+    // 可选：记录切换日志
+  }
+}
+
+// ========== 全局当前代理节点变量，防止未定义报错 ==========
+let currentNode = null;
