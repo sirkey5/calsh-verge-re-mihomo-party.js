@@ -10,15 +10,6 @@
  */
 const enable = true
 
-/**
- * 2025-05 优化说明：
- * 1. 节点分流、切换、优选等核心流程全面引入优质/劣质节点智能判定与周期自适应机制。
- * 2. 节点每30分钟评估一次，连续多次优/劣自动延长下次评估周期，优质节点优先权重显著提升。
- * 3. 节点选择、切换、分流等流程均优先考虑优质节点，保证高效、快速、精准、智能、科学、稳定。
- * 4. 评估标准支持多维度加权、历史表现、外部规则扩展，兼容AI/ML模型。
- * 5. 允许安全调用外部开源算法/规则，所有外部调用需保证安全性和稳定性。
- */
-
 // 提取公共CDN配置
 class CDN_CONFIG {
   constructor() {
@@ -290,9 +281,7 @@ function getNodePriorityWeight(node) {
 }
 
 async function selectBestNodeWithQuality(nodes) {
-  // 先评估所有节点质量
   await periodicEvaluateAllNodes(nodes);
-  // 计算AI评分并加权
   const results = await Promise.all(nodes.map(async n => {
     const metrics = await testNodeMultiMetrics(n);
     const history = nodeHistoryCache.get(n) ?? 1;
@@ -300,7 +289,6 @@ async function selectBestNodeWithQuality(nodes) {
     const weight = getNodePriorityWeight(n);
     return { node: n, aiScore, weight, status: nodeQualityStatus.get(n) };
   }));
-  // 优先选优质节点，按加权分排序
   results.sort((a, b) => (b.weight - a.weight) || (a.aiScore - b.aiScore));
   return results[0].node;
 }
@@ -393,30 +381,37 @@ async function checkNodeHealth(node) {
 // }
 
 class LRUCache {
-  constructor(capacity = 500) { // 增大默认缓存容量
-    this.memoryLimit = 1024 * 1024 * 50; // 新增50MB内存限制
-    this.defaultTTL = 300000; // 默认5分钟缓存
-    this.prefetchThreshold = 0.8; // 预取访问阈值
+  constructor(capacity = 500) {
+    this.memoryLimit = 1024 * 1024 * 50;
+    this.defaultTTL = 300000;
+    this.prefetchThreshold = 0.8;
+    this.map = new Map();
+    this.expireMap = new Map();
+    this.accessStats = new Map();
+    this.head = new Node('HEAD');
+    this.tail = new Node('TAIL');
+    this.head.next = this.tail;
+    this.tail.prev = this.head;
+    this.capacity = capacity;
   }
 
-  // 新增EDNS子网处理
-  _resolveWithEDNS(hostname) {
-    const ednsSubnet = '123.123.123.0/24'; // 示例EDNS子网
-    return `${hostname}?edns_subnet=${encodeURIComponent(ednsSubnet)}`;
+  _addNode(node) {
+    node.prev = this.head;
+    node.next = this.head.next;
+    this.head.next.prev = node;
+    this.head.next = node;
   }
 
-  // 增强版缓存获取
+  _removeNode(node) {
+    const prev = node.prev;
+    const next = node.next;
+    prev.next = next;
+    next.prev = prev;
+  }
+
   get(key) {
-    // 新增预取逻辑：高频访问项提前刷新
-    if(this.accessStats.has(key)) {
-      const stat = this.accessStats.get(key);
-      if(stat.count > 50 && stat.lastAccess < Date.now() - 30000) {
-        this._prefetch(key);
-      }
-    }
     if (!this.map.has(key)) return undefined;
     if (this._shouldEvict(key)) {
-      // 懒清理：访问时发现已过期则直接移除
       const node = this.map.get(key);
       this._removeNode(node);
       this.map.delete(key);
@@ -427,18 +422,15 @@ class LRUCache {
     const node = this.map.get(key);
     this._removeNode(node);
     this._addNode(node);
-    // 更新访问统计
     const stat = this.accessStats.get(key) || { count: 0, lastAccess: 0 };
     stat.count++;
     stat.lastAccess = Date.now();
     this.accessStats.set(key, stat);
-    // 访问时触发智能清理
     this._smartCleanup();
     return node.value;
   }
 
   set(key, value, ttl = this.defaultTTL) {
-    // ttl 单位毫秒，0 表示不过期
     if (this.map.has(key)) {
       const node = this.map.get(key);
       node.value = value;
@@ -456,15 +448,12 @@ class LRUCache {
       this.map.set(key, newNode);
       this._addNode(newNode);
     }
-    // 设置过期时间
     if (ttl > 0) {
       this.expireMap.set(key, Date.now() + ttl);
     } else {
       this.expireMap.delete(key);
     }
-    // 初始化访问统计
     this.accessStats.set(key, { count: 1, lastAccess: Date.now() });
-    // 写入时触发智能清理
     this._smartCleanup();
   }
 
@@ -475,8 +464,25 @@ class LRUCache {
     this.map.delete(key);
     this.expireMap.delete(key);
     this.accessStats.delete(key);
-    // 删除时触发智能清理
     this._smartCleanup();
+  }
+
+  _shouldEvict(key) {
+    const expireTime = this.expireMap.get(key);
+    return expireTime && Date.now() > expireTime;
+  }
+
+  _smartCleanup() {
+    if (this.map.size > this.capacity * 0.9) {
+      let current = this.tail.prev;
+      while (current !== this.head && this.map.size > this.capacity * 0.8) {
+        this._removeNode(current);
+        this.map.delete(current.key);
+        this.expireMap.delete(current.key);
+        this.accessStats.delete(current.key);
+        current = current.prev;
+      }
+    }
   }
 }
 
@@ -664,42 +670,41 @@ const dnsConfig = {
     fallbackPolicy: 'nearest'
   },
   cache: {
-    prefetch: 500,  // 预加载500条记录
+    prefetch: 500,
     prefetchDomains: [
       'google.com', 'youtube.com',
-      'netflix.com', 'microsoft.com',  // 新增微软域名
-      'spotify.com', 'amazon.com'      // 补充亚马逊域名
-    ]  // 热门域名预热
+      'netflix.com', 'microsoft.com',
+      'spotify.com', 'amazon.com'
+    ]
   },
   'certificate': [
-    'spki sha256//7HIpLefRz1P7GX2TjC1gV3RcGzOQ3sPDB5S3X5JFOI=',  // Cloudflare
-    'spki sha256//Y9mvm2zobJ5FYKjusS0u0WG3KY6Z+AP6XuvdVb7adIk='   // Google
+    'spki sha256//7HIpLefRz1P7GX2TjC1gV3RcGzOQ3sPDB5S3X5JFOI=',
+    'spki sha256//Y9mvm2zobJ5FYKjusS0u0WG3KY6Z+AP6XuvdVb7adIk='
   ],
   'use-hosts': false,
   'use-system-hosts': false,
   'respect-rules': true,
   'enhanced-mode': 'fake-ip',
   'fake-ip-range': '198.18.0.1/16',
-  timeout: 5000,      // 查询超时5秒
-  'persistent-cache': true,  // 启用持久化缓存
-  'default-nameserver': [...defaultDNS],  // 默认DNS服务器
-  'nameserver': [...foreignDNS],         // 主要境外DNS服务器
-  'proxy-server-nameserver': [...foreignDNS], // 代理服务器DNS
-  'fallback': [...chinaDNS, 'https://dns.google/dns-query'].filter(url => !url.includes('ghproxy.com')), // DNS查询失败时的备用服务器
+  timeout: 5000,
+  'persistent-cache': true,
+  'default-nameserver': [...defaultDNS],
+  'nameserver': [...foreignDNS],
+  'proxy-server-nameserver': [...foreignDNS],
+  'fallback': [...chinaDNS, 'https://dns.google/dns-query'].filter(url => !url.includes('ghproxy.com')),
   'nameserver-policy': {
     'geosite:cn': chinaDNS,
-    'geosite:geolocation-!cn': ['https://dns.quad9.net/dns-query', 'tls://8.8.8.8:853'] // 使用Quad9 DNS和谷歌加密DNS替代
+    'geosite:geolocation-!cn': ['https://dns.quad9.net/dns-query', 'tls://8.8.8.8:853']
   },
-
   'fallback-filter': {
-    'geoip': true,  // 启用GeoIP过滤
+    'geoip': true,
     'geoip-code': 'CN',
     'ipcidr': [
-      '10.0.0.0/8',      // 私有网络
-      '172.16.0.0/12',   // 私有网络
-      '192.168.0.0/16',  // 私有网络
-      '100.64.0.0/10',   // 运营商级NAT
-      '169.254.0.0/16'   // 链路本地地址
+      '10.0.0.0/8',
+      '172.16.0.0/12',
+      '192.168.0.0/16',
+      '100.64.0.0/10',
+      '169.254.0.0/16'
     ]
   },
   'fake-ip-filter': [
@@ -732,7 +737,6 @@ const dnsConfig = {
     '+.zte.home',             // 中兴路由器
     '+.phicomm.me',           // 斐讯路由器
     '+.miwifi.com',           // 小米路由器
-    
     // 时间同步服务
     '+.pool.ntp.org',         // NTP服务器
     'time.*.com',             // NTP服务器
