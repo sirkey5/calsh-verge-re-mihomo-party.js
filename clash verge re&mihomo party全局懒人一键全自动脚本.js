@@ -1015,15 +1015,50 @@ function detectTrafficPattern(trafficStats) {
 
 // =================== 节点AI/ML智能评分 =================== 
 function aiScoreNode({ latency, jitter, loss, bandwidth, history }) {
-  // 可扩展为ML模型，这里用加权评分，分数越低越优
-  const weights = { latency: 0.4, jitter: 0.15, loss: 0.25, bandwidth: 0.1, history: 0.1 };
+  const weights = { latency: 0.35, jitter: 0.1, loss: 0.25, bandwidth: 0.15, history: 0.15 };
   return (
     (latency || 1000) * weights.latency +
     (jitter || 0) * weights.jitter +
     (loss || 1) * 100 * weights.loss -
-    (bandwidth || 0) * weights.bandwidth - 
+    (bandwidth || 0) * weights.bandwidth -
     (history || 0) * 100 * weights.history
   );
+}
+
+// ========== 多维信息AI/ML预测与评分核心 ========== 
+// 多特征线性回归预测节点未来表现
+function predictNodeFuturePerformance(node) {
+  const records = nodeProfileDB.get(node) || [];
+  if (records.length < 5) return { expectedLatency: 9999, expectedLoss: 1, risk: 1 };
+  const recent = records.slice(-20);
+  // 多特征线性回归（延迟、丢包、带宽、历史分数）
+  let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+  for (let i = 0; i < recent.length; i++) {
+    const x = i;
+    const y = (recent[i].latency || 0) + (recent[i].loss || 0) * 1000 - (recent[i].bandwidth || 0) * 10 - (recent[i].history || 0) * 100;
+    sumX += x; sumY += y; sumXY += x * y; sumXX += x * x;
+  }
+  const n = recent.length;
+  const slope = n * sumXY - sumX * sumY ? (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX) : 0;
+  const intercept = (sumY - slope * sumX) / n;
+  // 预测下一个周期的表现
+  const predLatency = intercept + slope * n;
+  const avgLoss = recent.reduce((a, b) => a + (b.loss || 0), 0) / n;
+  const risk = Math.min(1, Math.max(0, avgLoss + (slope > 0 ? 0.2 : 0)));
+  return {
+    expectedLatency: predLatency,
+    expectedLoss: avgLoss,
+    risk
+  };
+}
+
+// 节点异常概率预测
+function predictNodeAnomaly(node) {
+  const records = nodeProfileDB.get(node) || [];
+  if (records.length < 5) return 0.5;
+  const recent = records.slice(-10);
+  const highLoss = recent.filter(r => r.loss > 0.3).length;
+  return highLoss / recent.length;
 }
 
 // =================== 主入口main流程增强 =================== 
@@ -1773,3 +1808,163 @@ async function autoUpdateCurrentNode(allNodes) {
 
 // ========== 全局当前代理节点变量，防止未定义报错 ==========
 let currentNode = null;
+
+// ========== 增强分流智能学习与多维度分析 ========== 
+const nodeProfileDB = new Map(); // 节点多维度历史档案
+const nodeGeoCache = new Map(); // 节点IP地理信息缓存
+const nodeDispatchTable = new Map(); // 分流分配表（user/业务/地理等 -> node）
+
+// 获取节点IP地理信息（可缓存）
+async function getNodeGeoInfo(ip) {
+  if (nodeGeoCache.has(ip)) return nodeGeoCache.get(ip);
+  try {
+    const res = await fetch(`http://ip-api.com/json/${ip}?fields=country,regionName,city,lat,lon,isp,query`, {timeout: 1500});
+    const data = await res.json();
+    nodeGeoCache.set(ip, data);
+    return data;
+  } catch { return null; }
+}
+
+// 节点网络请求后采集多维度数据
+async function recordNodeRequestMetrics(node, metrics) {
+  if (!nodeProfileDB.has(node)) nodeProfileDB.set(node, []);
+  nodeProfileDB.get(node).push({
+    ...metrics,
+    ts: Date.now()
+  });
+  // 限制历史长度
+  if (nodeProfileDB.get(node).length > 1000) nodeProfileDB.set(node, nodeProfileDB.get(node).slice(-1000));
+}
+
+// 智能学习与分流分配表更新
+async function learnAndUpdateNodeProfile() {
+  // 统计各节点多维度均值、方差、地理分布等
+  for (const [node, records] of nodeProfileDB.entries()) {
+    const recent = records.slice(-50); // 取近50次
+    const avgLatency = recent.reduce((a, b) => a + (b.latency || 0), 0) / recent.length;
+    const avgJitter = recent.reduce((a, b) => a + (b.jitter || 0), 0) / recent.length;
+    const avgLoss = recent.reduce((a, b) => a + (b.loss || 0), 0) / recent.length;
+    const avgBandwidth = recent.reduce((a, b) => a + (b.bandwidth || 0), 0) / recent.length;
+    // 可扩展更多统计
+    // 例如：统计地理分布、业务类型、用户分布等
+    // ...
+    // 结果可用于动态调整 nodeDispatchTable
+  }
+  // 示例：按地理/业务/用户等分流
+  // nodeDispatchTable.set('user:xxx', '节点A');
+}
+
+// 分流决策（优先分流表，其次优质节点）
+async function smartDispatchNode(user, nodes, context = {}) {
+  // context 可包含业务类型、地理、流量特征等
+  const key = context.userKey || user;
+  if (nodeDispatchTable.has(key)) {
+    const n = nodeDispatchTable.get(key);
+    if (nodes.includes(n)) return n;
+  }
+  // 没有分流表匹配，走优质节点
+  return await selectBestNodeWithQuality(nodes);
+}
+
+// 在 handleProxyRequest 入口增强：采集数据+分流优先
+async function handleProxyRequest(user, ...args) {
+  let currentNode = getCurrentNodeForUser(user);
+  const allNodes = getAllAvailableNodesForUser(user);
+  // 分流优先
+  const newNode = await smartDispatchNode(user, allNodes, { /* 可扩展context */ });
+  if (newNode !== currentNode) {
+    setCurrentNodeForUser(user, newNode);
+  }
+  // 采集本次请求的多维度数据
+  const metrics = await testNodeMultiMetrics(newNode);
+  // 获取IP地理信息
+  if (newNode.ip) {
+    metrics.geo = await getNodeGeoInfo(newNode.ip);
+  }
+  await recordNodeRequestMetrics(newNode, metrics);
+  // 可定期调用学习
+  if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
+  return proxyRequestWithNode(newNode, ...args);
+}
+
+// ========== 多维信息预测研判管理机制 ========== 
+// 预测节点未来表现（可扩展为AI/ML模型）
+function predictNodeFuturePerformance(node) {
+  const records = nodeProfileDB.get(node) || [];
+  if (records.length < 5) return { expectedLatency: 9999, expectedLoss: 1, risk: 1 };
+  // 简单线性回归/滑动均值预测，可扩展为更复杂模型
+  const recent = records.slice(-10);
+  const avgLatency = recent.reduce((a, b) => a + (b.latency || 0), 0) / recent.length;
+  const avgLoss = recent.reduce((a, b) => a + (b.loss || 0), 0) / recent.length;
+  // 预测未来一段时间的表现
+  const trend = (recent[recent.length-1]?.latency || 0) - (recent[0]?.latency || 0);
+  const risk = avgLoss + (trend > 0 ? 0.2 : 0); // 延迟上升则风险加权
+  return {
+    expectedLatency: avgLatency + trend * 0.5,
+    expectedLoss: avgLoss,
+    risk: Math.min(1, Math.max(0, risk))
+  };
+}
+
+// 预测异常概率（如未来丢包、不可用等）
+function predictNodeAnomaly(node) {
+  const records = nodeProfileDB.get(node) || [];
+  if (records.length < 5) return 0.5;
+  const recent = records.slice(-10);
+  const highLoss = recent.filter(r => r.loss > 0.3).length;
+  return highLoss / recent.length;
+}
+
+// 智能学习流程中集成预测结果
+async function learnAndUpdateNodeProfile() {
+  for (const [node, records] of nodeProfileDB.entries()) {
+    const pred = predictNodeFuturePerformance(node);
+    // 可将预测结果用于动态调整分流表、优先级、预警等
+    if (pred.risk > 0.7) {
+      // 高风险节点可降低分流优先级或标记为待观察
+      nodeDispatchTable.forEach((v, k) => { if (v === node) nodeDispatchTable.delete(k); });
+    }
+    // ...可扩展更多预测驱动的管理逻辑...
+  }
+}
+
+// 分流决策时可参考预测结果
+async function smartDispatchNode(user, nodes, context = {}) {
+  const key = context.userKey || user;
+  if (nodeDispatchTable.has(key)) {
+    const n = nodeDispatchTable.get(key);
+    if (nodes.includes(n)) return n;
+  }
+  // 预测未来表现，优先低风险、低延迟节点
+  const candidates = nodes.map(n => ({ node: n, pred: predictNodeFuturePerformance(n) }))
+    .filter(x => x.pred.risk < 0.8)
+    .sort((a, b) => (a.pred.expectedLatency - b.pred.expectedLatency));
+  if (candidates.length > 0) return candidates[0].node;
+  return await selectBestNodeWithQuality(nodes);
+}
+
+// ========== 节点全自动切换与分流主流程优化 ==========
+async function handleProxyRequest(user, ...args) {
+  let currentNode = getCurrentNodeForUser(user);
+  const allNodes = getAllAvailableNodesForUser(user);
+  // 分流优先，AI预测驱动
+  const newNode = await smartDispatchNode(user, allNodes, { /* 可扩展context */ });
+  if (newNode !== currentNode) {
+    setCurrentNodeForUser(user, newNode);
+  }
+  // 采集本次请求的多维度数据
+  const metrics = await testNodeMultiMetrics(newNode);
+  if (newNode.ip) {
+    metrics.geo = await getNodeGeoInfo(newNode.ip);
+  }
+  await recordNodeRequestMetrics(newNode, metrics);
+  // 定期自学习与分流表动态调整
+  if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
+  // 节点异常自动降级，恢复后自动提升
+  if (predictNodeAnomaly(newNode) > 0.7) {
+    nodeQualityStatus.set(newNode, 'bad');
+  } else if (predictNodeAnomaly(newNode) < 0.2) {
+    nodeQualityStatus.set(newNode, 'good');
+  }
+  return proxyRequestWithNode(newNode, ...args);
+}
