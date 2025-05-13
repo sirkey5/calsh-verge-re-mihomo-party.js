@@ -1968,3 +1968,80 @@ async function handleProxyRequest(user, ...args) {
   }
   return proxyRequestWithNode(newNode, ...args);
 }
+
+// ========== AI数据持久化与六维淘汰机制增强（兼容SubStore/浏览器） ========== 
+const AI_DB_KEY = 'ai_node_data';
+
+function isSubStore() {
+  return typeof $persistentStore !== 'undefined';
+}
+function isBrowser() {
+  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+}
+
+// 加载AI数据
+function loadAIDBFromFile() {
+  try {
+    let raw = '';
+    if (isSubStore()) {
+      raw = $persistentStore.read(AI_DB_KEY) || '';
+    } else if (isBrowser()) {
+      raw = window.localStorage.getItem(AI_DB_KEY) || '';
+    }
+    if (raw) {
+      const obj = JSON.parse(raw);
+      for (const [k, v] of Object.entries(obj)) nodeProfileDB.set(k, v);
+    }
+  } catch (e) { console.error('AI数据加载失败', e); }
+}
+
+// 保存AI数据
+function saveAIDBToFile() {
+  try {
+    const obj = {};
+    for (const [k, v] of nodeProfileDB.entries()) obj[k] = v;
+    const raw = JSON.stringify(obj, null, 2);
+    if (isSubStore()) {
+      $persistentStore.write(raw, AI_DB_KEY);
+    } else if (isBrowser()) {
+      window.localStorage.setItem(AI_DB_KEY, raw);
+    }
+  } catch (e) { console.error('AI数据保存失败', e); }
+}
+
+// 六维度淘汰机制
+function autoEliminateAIDB() {
+  for (const [node, records] of nodeProfileDB.entries()) {
+    const pred = predictNodeFuturePerformance(node);
+    if (pred.risk > 0.95) { nodeProfileDB.delete(node); continue; }
+    const avgScore = records.reduce((a, b) => a + (b.aiScore || 0), 0) / (records.length || 1);
+    if (avgScore < -500) { nodeProfileDB.delete(node); continue; }
+    const latencies = records.map(r => r.latency).filter(Boolean);
+    if (latencies.length > 10) {
+      const mean = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+      const variance = latencies.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / latencies.length;
+      if (variance > 1000000) { nodeProfileDB.delete(node); continue; }
+    }
+    if (records.slice(-5).filter(r => r.loss > 0.5 || r.latency > 2000).length >= 5) {
+      nodeProfileDB.delete(node); continue;
+    }
+  }
+  saveAIDBToFile();
+}
+
+// 启动时自动加载
+loadAIDBFromFile();
+
+// 在采集、学习、请求等流程中自动持久化和淘汰
+const _oldRecordNodeRequestMetrics = recordNodeRequestMetrics;
+recordNodeRequestMetrics = async function(node, metrics) {
+  await _oldRecordNodeRequestMetrics(node, metrics);
+  autoEliminateAIDB();
+  saveAIDBToFile();
+};
+const _oldLearnAndUpdateNodeProfile = learnAndUpdateNodeProfile;
+learnAndUpdateNodeProfile = async function() {
+  await _oldLearnAndUpdateNodeProfile();
+  autoEliminateAIDB();
+  saveAIDBToFile();
+};
