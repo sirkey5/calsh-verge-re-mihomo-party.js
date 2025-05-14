@@ -11,8 +11,13 @@
 const enable = true
 
 // 提取公共CDN配置
+
+
+
+
 class CDN_CONFIG {
   constructor() {
+    this.prober = new NetworkProber();
     this.nodeStats = new Map();
     this.trafficPatterns = new Map();
     this.historyWindow = 24 * 60 * 60 * 1000;
@@ -29,7 +34,6 @@ class CDN_CONFIG {
     this.packetLossThreshold = 0.15; // 降低丢包率阈值
     this.latencyThreshold = 500; // 降低延迟阈值
     this.historyThreshold = 0.8; // 提高历史成功率要求
-    this.tcpProbes = 8; // 增加TCP探测次数
     this.stabilityWeights = { // 新增稳定性权重
       latency: 0.6,
       packetLoss: 0.3,
@@ -82,48 +86,7 @@ class CDN_CONFIG {
   }
 
   async _probeTCPLatency(url) {
-    const results = { successes: 0, latencies: [], jitters: [] };
-    const hostname = new URL(url).hostname;
-    
-    // 智能EDNS子网选择
-    const ednsSubnet = this._selectOptimalSubnet(); 
-    
-    // 自适应探测次数
-    const probes = Math.min(this.tcpProbes + Math.floor(this.networkLoad * 2), 15);
-    for (let i = 0; i < probes; i++) {
-      const start = Date.now();
-      try {
-        await fetch(`http://${hostname}?edns_subnet=${encodeURIComponent(ednsSubnet)}`, {
-          method: 'HEAD',
-          redirect: 'manual',
-          timeout: 800
-        });
-        const latency = Date.now() - start;
-        // 新增延迟平滑处理（EMA）
-        if(results.latencies.length > 0) {
-          latency = latency * 0.7 + results.latencies[results.latencies.length-1] * 0.3;
-        }
-        results.latencies.push(latency);
-        results.successes++;
-      } catch (e) {
-        results.latencies.push(Infinity);
-      }
-    }
-    
-    // 计算统计指标
-    const validLatencies = results.latencies.filter(l => l !== Infinity);
-    const avgLatency = validLatencies.reduce((a, b) => a + b, 0) / validLatencies.length;
-    const latencyStdDev = Math.sqrt(
-      validLatencies.map(x => Math.pow(x - avgLatency, 2))
-        .reduce((a, b) => a + b) / validLatencies.length
-    );
-
-    return {
-      avgLatency,
-      latencyStdDev, // 新增延迟标准差
-      packetLossRate: 1 - (results.successes / this.tcpProbes),
-      successStreak: this.historyStats.get(url)?.successRate || 0
-    };
+    return this.prober.probeTCP(url);
   }
 
   _handleUnhealthyCDN(url, failures) {
@@ -215,10 +178,11 @@ class CDN_CONFIG {
       
       // 多维评分要素
       const successRate = this.historyStats.get(url)?.successRate || 0;
-      const stabilityScore = 
-        (stats.avgLatency * this.stabilityWeights.latency) * trafficPattern.latencyWeight * prediction.latencyFactor +
-        (stats.packetLoss * 1000 * this.stabilityWeights.packetLoss) * trafficPattern.lossWeight * prediction.lossImpact +
-        ((1 - successRate) * 1000 * this.stabilityWeights.successRate) * trafficPattern.successWeight * prediction.successImpact;
+      const { latencyFactor, lossImpact, successImpact } = this._getPredictionFactors(url);
+    const stabilityScore = 
+        (stats.avgLatency * this.stabilityWeights.latency) * trafficPattern.latencyWeight * latencyFactor +
+        (stats.packetLoss * 1000 * this.stabilityWeights.packetLoss) * trafficPattern.lossWeight * lossImpact +
+        ((1 - successRate) * 1000 * this.stabilityWeights.successRate) * trafficPattern.successWeight * successImpact;
 
       // 新增突发流量容忍系数
       return stabilityScore * (1 + Math.min(trafficPattern.burstTolerance, 0.2));
@@ -243,11 +207,10 @@ const BASE_EVAL_INTERVAL = 30 * 60 * 1000; // 30分钟
 const MAX_EVAL_INTERVAL = 24 * 60 * 60 * 1000; // 最长24小时
 const QUALITY_THRESHOLD = { good: 3, bad: 3 };
 
-function getEvalInterval(node) {
-  // 连续优/劣次数越多，评估周期越长，指数增长
+const getEvalInterval = (node) => {
   const score = nodeQualityScore.get(node) || 0;
-  return Math.min(BASE_EVAL_INTERVAL * Math.pow(2, Math.abs(score)), MAX_EVAL_INTERVAL);
-}
+  return Math.min(BASE_EVAL_INTERVAL * (2 ** Math.abs(score)), MAX_EVAL_INTERVAL);
+};
 
 
 
@@ -1773,8 +1736,8 @@ async function handleProxyRequest(user, ...args) {
 
 // ========== 全自动节点切换辅助函数 ========== 
 async function autoUpdateCurrentNode(allNodes) {
-  // 智能切换，自动更新全局currentNode
-  const newNode = await smartAutoSwitchNode(currentNode, allNodes);
+  const nodeManager = NodeManager.getInstance();
+  const newNode = await nodeManager.coordinatedSwitch(currentNode, allNodes, 'scheduled_update');
   if (newNode !== currentNode) {
     currentNode = newNode;
     // 可选：记录切换日志
@@ -1992,14 +1955,21 @@ async function smartDispatchNode(user, nodes, context = {}) {
 // ========== 节点全自动切换与分流主流程优化 ==========
 async function handleProxyRequest(user, ...args) {
   try {
+    const nodeManager = NodeManager.getInstance();
     let currentNode = nodeManager.getNodeDispatch(user);
     const allNodes = getAllAvailableNodesForUser(user);
 
-    // 分流优先，AI预测驱动
-    const newNode = await smartDispatchNode(user, allNodes, { /* 可扩展context */ });
+    // 客户端地理信息采集
+    const clientIP = req.headers.get('X-Forwarded-For') || req.headers.get('Remote-Address');
+    const clientGeo = await getNodeGeoInfo(clientIP);
 
+    // 分流优先，AI预测驱动
+    const newNode = await smartDispatchNode(user, allNodes, { clientGeo });
+
+    // 协调切换
     if (newNode !== currentNode) {
-      nodeManager.updateNodeDispatch(user, newNode);
+      await nodeManager.coordinatedSwitch(currentNode, allNodes, 'traffic_based');
+      currentNode = nodeManager.getNodeDispatch(user);
     }
 
     // 采集本次请求的多维度数据
@@ -2015,16 +1985,17 @@ async function handleProxyRequest(user, ...args) {
     if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
 
     // 节点异常自动降级，恢复后自动提升
-    if (predictNodeAnomaly(newNode) > 0.7) {
+    const anomalyScore = predictNodeAnomaly(newNode);
+    if (anomalyScore > 0.7) {
       nodeManager.updateNodeHealth(newNode, 'bad');
-    } else if (predictNodeAnomaly(newNode) < 0.2) {
+    } else if (anomalyScore < 0.2) {
       nodeManager.updateNodeHealth(newNode, 'good');
     }
 
     return proxyRequestWithNode(newNode, ...args);
   } catch (error) {
     console.error('代理请求处理失败:', error);
-    return proxyRequestWithNode(currentNode || '直连', ...args);
+    return proxyRequestWithNode('直连', ...args);
   }
 }
 
@@ -2104,3 +2075,294 @@ learnAndUpdateNodeProfile = async function() {
   autoEliminateAIDB();
   saveAIDBToFile();
 };
+
+// 修改点1：统一节点切换管理器
+class NodeManager {
+  constructor() {
+    this.currentNode = null;
+    this.nodeSwitchCooldown = new Map();
+    this.BASE_SWITCH_COOLDOWN = 30 * 60 * 1000;
+    this.MAX_SWITCH_COOLDOWN = 24 * 60 * 60 * 1000;
+    this.switchHistory = [];
+    this.HISTORY_WINDOW = 7 * 24 * 60 * 60 * 1000; // 保留7天历史
+  }
+
+  // 单例模式
+  static getInstance() {
+    if (!NodeManager.instance) {
+      NodeManager.instance = new NodeManager();
+    }
+    return NodeManager.instance;
+  }
+
+  async updateNodeDispatch(user, node) {
+    // 添加版本控制的分流表更新
+    const key = `${user}@${Date.now().toString().slice(0, -3)}`;
+    nodeDispatchTable.set(key, node);
+    this._cleanupOldVersions(user);
+  }
+
+  _cleanupOldVersions(user) {
+    // 清理旧版本分流记录
+    const now = Date.now();
+    for (const [key, value] of nodeDispatchTable.entries()) {
+      if (key.startsWith(user) && parseInt(key.split('@')[1]) < now - this.HISTORY_WINDOW) {
+        nodeDispatchTable.delete(key);
+      }
+    }
+  }
+
+  recordSwitchEvent(oldNode, newNode, reason) {
+    // 记录切换事件用于后续分析
+    this.switchHistory.push({
+      timestamp: Date.now(),
+      oldNode,
+      newNode,
+      reason,
+      riskLevel: this.calculateRiskLevel(oldNode, newNode)
+    });
+    this._pruneHistory();
+  }
+
+  calculateRiskLevel(oldNode, newNode) {
+    // 计算切换风险等级
+    if (!oldNode || !newNode) return 0;
+    
+    const oldPred = predictNodeFuturePerformance(oldNode);
+    const newPred = predictNodeFuturePerformance(newNode);
+    
+    return Math.max(
+      0,
+      Math.min(5, Math.floor((newPred.risk - oldPred.risk) / 0.2))
+    );
+  }
+
+  _prunHistory() {
+    // 保留最近30天的切换记录
+    const now = Date.now();
+    this.switchHistory = this.switchHistory.filter(
+      event => event.timestamp > now - 30 * 24 * 60 * 60 * 1000
+    );
+  }
+
+  async coordinatedSwitch(currentNode, allNodes, triggerReason) {
+    // 协调所有切换机制的统一入口
+    try {
+      // 检查冷却状态
+      if (this._isInCooldown(currentNode)) {
+        return currentNode;
+      }
+
+      // 获取健康节点
+      const healthyNodes = await this._filterHealthyNodes(allNodes);
+      
+      // 获取最优节点
+      const bestNode = await this._getOptimalNode(healthyNodes, currentNode);
+      
+      // 检查是否需要切换
+      if (await this._shouldSwitch(currentNode, bestNode)) {
+        const cooldown = this._calculateCooldown(bestNode);
+        this._applyNodeSwitch(currentNode, bestNode, cooldown, triggerReason);
+        return bestNode;
+      }
+      
+      return currentNode;
+    } catch (error) {
+      console.error('节点切换协调失败:', error);
+      return this._fallbackStrategy(currentNode, allNodes);
+    }
+  }
+
+  _isInCooldown(node) {
+    // 综合判断是否在冷却期
+    return !!(this.nodeSwitchCooldown.get(node) && 
+           Date.now() < this.nodeSwitchCooldown.get(node));
+  }
+
+  async _filterHealthyNodes(nodes) {
+    // 综合健康检查
+    return nodes.filter(async node => {
+      const metrics = await testNodeMultiMetrics(node);
+      const pred = predictNodeFuturePerformance(node);
+      
+      // 健康标准：风险低于0.8且延迟低于1000ms
+      return pred.risk < 0.8 && metrics.latency < 1000;
+    });
+  }
+
+  async _getOptimalNode(nodes, currentNode) {
+    // 综合评分选择最优节点
+    const candidates = await Promise.all(nodes.map(async node => {
+      const metrics = await testNodeMultiMetrics(node);
+      const pred = predictNodeFuturePerformance(node);
+      
+      // 综合评分公式（平衡各因素）
+      const score = (
+        0.4 * (1 / (metrics.latency || 1)) + 
+        0.3 * (1 - metrics.loss) + 
+        0.2 * (1 - pred.risk) +
+        0.1 * (1 - metrics.jitter / 100)
+      );
+      
+      return { node, score };
+    }));
+    
+    // 按评分排序
+    candidates.sort((a, b) => b.score - a.score);
+    
+    // 如果当前节点在候选列表中且不是最差选择，则保持当前节点
+    if (candidates[0].node !== currentNode && 
+        candidates.some(c => c.node === currentNode) &&
+        candidates.findIndex(c => c.node === currentNode) <= Math.min(2, candidates.length/3)) {
+      return currentNode;
+    }
+    
+    return candidates[0].node;
+  }
+
+  async _shouldSwitch(currentNode, bestNode) {
+    // 综合判断是否需要切换
+    const [currentMetrics, bestMetrics] = await Promise.all([
+      testNodeMultiMetrics(currentNode),
+      testNodeMultiMetrics(bestNode)
+    ]);
+    
+    // 如果当前节点已满足阈值则不切换
+    if (currentMetrics.latency < 300 && currentMetrics.loss < 0.1) {
+      return false;
+    }
+    
+    // 如果最佳节点优势不足20%则不切换
+    const improvement = (currentMetrics.latency - bestMetrics.latency) / currentMetrics.latency;
+    return improvement > 0.2;
+  }
+
+  _calculateCooldown(node) {
+    // 动态计算冷却时间（优质节点延长，劣质节点缩短）
+    const score = nodeQualityScore.get(node) || 0;
+    let baseCooldown = this.BASE_SWITCH_COOLDOWN;
+    
+    // 根据历史表现调整冷却时间
+    if (score > 2) {
+      baseCooldown *= Math.pow(2, Math.min(5, score));
+    } else if (score < -1) {
+      baseCooldown /= 2;
+    }
+    
+    return Math.min(
+      Math.max(baseCooldown, this.BASE_SWITCH_COOLDOWN/2),
+      this.MAX_SWITCH_COOLDOWN
+    );
+  }
+
+  _applyNodeSwitch(oldNode, newNode, cooldown, reason) {
+    // 执行节点切换并更新状态
+    this.nodeSwitchCooldown.set(newNode, Date.now() + cooldown);
+    this.nodeSwitchCooldown.delete(oldNode); // 移除旧节点冷却
+    
+    // 更新节点质量评分
+    this._updateQualityScore(newNode, true);
+    this._updateQualityScore(oldNode, false);
+    
+    // 记录切换事件
+    this.recordSwitchEvent(oldNode, newNode, reason);
+    
+    // 实际切换操作
+    setCurrentNodeForUser(user, newNode);
+  }
+
+  _updateQualityScore(node, isGood) {
+    // 改进质量评分算法
+    const currentScore = nodeQualityScore.get(node) || 0;
+    const delta = isGood ? 1 : -1;
+    const newScore = Math.max(-5, Math.min(5, currentScore + delta));
+    
+    nodeQualityScore.set(node, newScore);
+    nodeQualityStatus.set(node, 
+      newScore > 2 ? 'good' : 
+      newScore < -2 ? 'bad' : 'normal'
+    );
+  }
+
+  _fallbackStrategy(currentNode, allNodes) {
+    // 多级降级策略
+    const history = nodeHistoryCache.get(currentNode) || 0;
+    
+    if (history < 0.5) {
+      // 尝试历史优质节点
+      const historyBest = this._getHistoryBest(allNodes);
+      if (historyBest) return historyBest;
+    }
+    
+    // 最后尝试直连
+    return '直连';
+  }
+
+  _getHistoryBest(nodes) {
+    // 获取历史最优节点
+    const historyScores = nodes.map(node => ({
+      node,
+      history: nodeHistoryCache.get(node) || 0
+    }));
+    
+    historyScores.sort((a, b) => b.history - a.history);
+    return historyScores[0]?.node;
+  }
+}
+
+// 修改点2：协调main函数中的自动更新
+async function autoUpdateCurrentNode(allNodes) {
+  const nodeManager = NodeManager.getInstance();
+  const newNode = await nodeManager.coordinatedSwitch(currentNode, allNodes, 'scheduled_update');
+  if (newNode !== currentNode) {
+    currentNode = newNode;
+    // 可选：记录切换日志
+  }
+}
+
+// 修改点3：协调handleProxyRequest中的切换逻辑
+async function handleProxyRequest(user, req, ...args) {
+  try {
+    const nodeManager = NodeManager.getInstance();
+    let currentNode = nodeManager.getNodeDispatch(user);
+    const allNodes = getAllAvailableNodesForUser(user);
+
+    // 客户端地理信息采集
+    const clientIP = req.headers.get('X-Forwarded-For') || req.headers.get('Remote-Address');
+    const clientGeo = await getNodeGeoInfo(clientIP);
+
+    // 分流优先，AI预测驱动
+    const newNode = await smartDispatchNode(user, allNodes, { clientGeo });
+
+    // 协调切换
+    if (newNode !== currentNode) {
+      await nodeManager.coordinatedSwitch(currentNode, allNodes, 'traffic_based');
+      currentNode = nodeManager.getNodeDispatch(user);
+    }
+
+    // 采集本次请求的多维度数据
+    const metrics = await testNodeMultiMetrics(newNode);
+    if (newNode.ip) {
+      metrics.geo = await getNodeGeoInfo(newNode.ip);
+    }
+
+    // 记录节点请求指标
+    recordNodeRequestMetrics(newNode, metrics);
+
+    // 定期自学习与分流表动态调整
+    if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
+
+    // 节点异常自动降级，恢复后自动提升
+    const anomalyScore = predictNodeAnomaly(newNode);
+    if (anomalyScore > 0.7) {
+      nodeManager.updateNodeHealth(newNode, 'bad');
+    } else if (anomalyScore < 0.2) {
+      nodeManager.updateNodeHealth(newNode, 'good');
+    }
+
+    return proxyRequestWithNode(newNode, ...args);
+  } catch (error) {
+    console.error('代理请求处理失败:', error);
+    return proxyRequestWithNode('直连', ...args);
+  }
+}
