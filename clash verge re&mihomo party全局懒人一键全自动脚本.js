@@ -1930,13 +1930,57 @@ async function learnAndUpdateNodeProfile() {
   }
 }
 
-// 分流决策时可参考预测结果
+async function handleProxyRequest(user, req, ...args) {
+  let currentNode = nodeManager.getNodeDispatch(user);
+  const allNodes = getAllAvailableNodesForUser(user);
+
+  // 获取客户端IP地址
+  const clientIP = req.headers.get('X-Forwarded-For') || req.headers.get('Remote-Address');
+
+  // 获取客户端IP的地理信息
+  const clientGeo = await getNodeGeoInfo(clientIP);
+
+  // 分流优先，AI预测驱动
+  const newNode = await smartDispatchNode(user, allNodes, { clientGeo });
+
+  if (newNode !== currentNode) {
+    nodeManager.updateNodeDispatch(user, newNode);
+  }
+
+  // 采集本次请求的多维度数据
+  const metrics = await testNodeMultiMetrics(newNode);
+  if (newNode.ip) {
+    metrics.geo = await getNodeGeoInfo(newNode.ip);
+  }
+
+  // 记录节点请求指标
+  recordNodeRequestMetrics(newNode, metrics);
+
+  // 定期自学习与分流表动态调整
+  if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
+
+  // 节点异常自动降级，恢复后自动提升
+  if (predictNodeAnomaly(newNode) > 0.7) {
+    nodeManager.updateNodeHealth(newNode, 'bad');
+  } else if (predictNodeAnomaly(newNode) < 0.2) {
+    nodeManager.updateNodeHealth(newNode, 'good');
+  }
+
+  return proxyRequestWithNode(newNode, ...args);
+}
+
 async function smartDispatchNode(user, nodes, context = {}) {
   const key = context.userKey || user;
   if (nodeDispatchTable.has(key)) {
     const n = nodeDispatchTable.get(key);
     if (nodes.includes(n)) return n;
   }
+
+  // 如果客户端来自中国大陆，则直接使用直连节点
+  if (context.clientGeo && context.clientGeo.country === 'China') {
+    return '直连';
+  }
+
   // 预测未来表现，优先低风险、低延迟节点
   const candidates = nodes.map(n => ({ node: n, pred: predictNodeFuturePerformance(n) }))
     .filter(x => x.pred.risk < 0.8)
