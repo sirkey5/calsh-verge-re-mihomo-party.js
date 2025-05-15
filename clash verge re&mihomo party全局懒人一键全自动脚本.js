@@ -15,6 +15,40 @@ class AppState {
   });
 }
 
+class RollingStats {
+  constructor(windowSize = 100) {
+    this.values = [];
+    this.windowSize = windowSize;
+  }
+
+  add(value) {
+    this.values.push(value);
+    if (this.values.length > this.windowSize) {
+      this.values.shift();
+    }
+  }
+
+  get average() {
+    return this.values.reduce((a, b) => a + b, 0) / this.values.length || 0;
+  }
+}
+
+class SuccessRateTracker {
+  constructor() {
+    this.successes = 0;
+    this.total = 0;
+  }
+
+  add(result) {
+    this.total++;
+    if (result) this.successes++;
+  }
+
+  get rate() {
+    return this.total > 0 ? this.successes / this.total : 1;
+  }
+}
+
 /**
  * 整个脚本的总开关，在Mihomo Party使用的话，请保持为true
  * true = 启用
@@ -27,21 +61,124 @@ const enable = true
 
 
 
-class NetworkProber {
-  async probeTCP(url) {
+// NetworkProber功能已整合至CentralManager
+
+class CentralManager {
+  static instance = new this();
+  constructor() {
+    this.manager = CentralManager.instance;
+    this.metricsRegistry = new Map([
+      ['latency', new RollingStats(100)],
+      ['packetLoss', new RollingStats(100)],
+      ['successRate', new SuccessRateTracker()]
+    ]);
+    this.cdnPool = [
+      'https://cdn.jsdelivr.net/gh/',
+      'https://fastly.jsdelivr.net/gh/',
+      'https://testingcf.jsdelivr.net/gh/'
+    ];
+    this.activeIndex = 0;
+    this.failureCounts = new Map();
+    this.nodeStats = new Map();
+    this.trafficPatterns = new Map();
+    this.historyWindow = 24 * 60 * 60 * 1000;
+  }
+
+  calculateDynamicWeights() {
+    // 迁移智能调度核心算法
+    this._detectPeriodicity = (data) => {
+      const Fs = 1000;
+      const N = data.length;
+      const freqs = new Float32Array(N/2);
+      
+      for(let k=0; k<N/2; k++){
+        let re = 0, im = 0;
+        for(let n=0; n<N; n++){
+          const angle = 2*Math.PI*k*n/N;
+          re += data[n] * Math.cos(angle);
+          im -= data[n] * Math.sin(angle);
+        }
+        freqs[k] = Math.hypot(re, im)/N;
+      }
+      
+      const maxIndex = freqs.indexOf(Math.max(...freqs));
+      return {
+        period: Math.round((N/2)/(maxIndex || 1)*1000),
+        confidence: freqs[maxIndex]/freqs.reduce((a,b)=>a+b,0)
+      };
+    };
+
+    this._clusterGeoData = (data) => ({
+      clusters: 3, 
+      centroid: [114.08, 22.54]
+    });
+
     return {
-      avgLatency: performance.now(),
-      packetLossRate: 0,
-      minLatency: 0,
-      maxLatency: 0
+      latencyWeight: this._getTrafficFactor('latency'),
+      lossWeight: this._getTrafficFactor('loss')
     };
   }
 
-  async probeUDP(url) {
+  // 统一探测方法
+  async probeEndpoint(url) {
+    const [tcpResult, udpResult] = await Promise.all([
+      this.prober.probeTCP(url),
+      this.prober.probeUDP(url)
+    ]);
+    return this._normalizeMetrics(tcpResult, udpResult);
+  }
+
+  // 统一健康检查
+  async performHealthCheck(url) {
+    const failures = this.failureCounts.get(url) || 0;
+    try {
+      const metrics = await this.probeEndpoint(url);
+      if (this._isUnhealthy(metrics)) {
+        return this._handleFailure(url, failures);
+      }
+      this._updateAllMetrics(url, metrics);
+      return true;
+    } catch (e) {
+      return this._handleFailure(url, failures);
+    }
+  }
+
+  // 统一阈值管理
+  get dynamicThresholds() {
     return {
-      avgLatency: performance.now(),
-      jitter: 0
+      latency: 500 * (1 + Math.random() * 0.15 - 0.075),
+      packetLoss: 0.15 * (1 + Math.random() * 0.2 - 0.1)
     };
+  }
+
+  _normalizeMetrics(tcp, udp) {
+    return {
+      latency: tcp.avgLatency,
+      packetLoss: tcp.packetLossRate,
+      jitter: udp.jitter,
+      timestamp: Date.now()
+    };
+  }
+
+  _isUnhealthy(metrics) {
+    const thresholds = this.dynamicThresholds;
+    return metrics.latency > thresholds.latency || 
+           metrics.packetLoss > thresholds.packetLoss;
+  }
+
+  _handleFailure(url, failures) {
+    this.failureCounts.set(url, failures + 1);
+    if (failures >= 2) {
+      this.activeIndex = (this.activeIndex + 1) % this.cdnPool.length;
+      this.failureCounts.set(url, 0);
+    }
+    return false;
+  }
+
+  _updateAllMetrics(url, metrics) {
+    for (const [type, collector] of this.metricsRegistry) {
+      collector.add(type === 'successRate' ? 1 : metrics[type]);
+    }
   }
 }
 
@@ -49,7 +186,7 @@ class CDN_CONFIG {
   constructor() {
     this.jsdelivr = 'https://cdn.jsdelivr.net/gh/';
     this.fallback = 'https://fallback.example.com/';
-    this.prober = new NetworkProber();
+    this.manager = CentralManager.instance;
     this.nodeStats = new Map();
     this.trafficPatterns = new Map();
     this.historyWindow = 24 * 60 * 60 * 1000;
@@ -86,191 +223,55 @@ class CDN_CONFIG {
   }
 
   async healthCheck(url) {
-    const failures = this._initFailureCount(url);
-    const tcpResults = await this._probeTCPLatency(url);
-    if (this._checkUnhealthyStatus(tcpResults)) {
-      return this._handleUnhealthyCDN(url, failures);
-    }
-    return this._performHttpCheck(url, failures, tcpResults);
+    return this.manager.performHealthCheck(url);
   }
 
-  _initFailureCount(url) {
-    if (!this.failureCount.has(url)) this.failureCount.set(url, 0);
-    return this.failureCount.get(url);
-  }
 
-  _checkUnhealthyStatus(tcpResults) {
-    const { dynamicLatency, dynamicPacketLoss } = this._getDynamicThresholds();
-    return this._isUnhealthy(tcpResults, dynamicLatency, dynamicPacketLoss);
-  }
 
-  async _performHttpCheck(url, failures, tcpResults) {
-    return this._checkHttpHealth(url, failures, tcpResults);
-  }
 
+
+
+
+  // 动态阈值使用中央管理器版本
   _getDynamicThresholds() {
-    return this._calculateThresholds(['latency', 'packetLoss']);
+    return CentralManager.instance.dynamicThresholds;
   }
 
-  _calculateThresholds(types) {
-    return types.reduce((acc, type) => {
-      const threshold = this[`${type}Threshold`];
-      const range = type === 'latency' ? 0.15 : 0.2;
-      acc[`dynamic${type[0].toUpperCase() + type.slice(1)}`] = threshold * (1 + Math.random() * range - range/2);
-      return acc;
-    }, {});
-  }
 
-  _isUnhealthy(tcpResults, dynamicLatency, dynamicPacketLoss) {
-    return this._checkThresholdViolation(tcpResults, { latency: dynamicLatency, packetLoss: dynamicPacketLoss });
-  }
 
-  _checkThresholdViolation(results, thresholds) {
-    return Object.entries(thresholds).some(([type, threshold]) => 
-      results[`${type}Rate`] > threshold
-    );
-  }
 
-  async _checkHttpHealth(url, failures, tcpResults) {
-    try {
-      const httpResult = await fetch(`${url}healthcheck`, {
-        method: 'HEAD',
-        timeout: 1500,
-        keepalive: true
-      });
-      if (!httpResult.ok) return this._handleUnhealthyCDN(url, failures);
-      this._updateNetworkMetrics(url, tcpResults);
-      this.failureCount.set(url, 0);
-      return true;
-    } catch (e) {
-      return this._handleUnhealthyCDN(url, failures);
-    }
-  }
 
-  // 并行探测机制
-  async _probeNetwork(url) {
-    return this._probeLatency(url, ['tcp', 'udp']);
-  }
 
-  async _probeNetwork(url) {
-    const [tcpResult, udpResult] = await Promise.all([
-      this.prober.probeTCP(url),
-      this.prober.probeUDP(url)
-    ]);
-    return {
-      ...tcpResult,
-      udpLatency: udpResult.avgLatency,
-      udpJitter: udpResult.jitter
-    };
-  }
 
+
+
+
+
+
+
+  // 故障处理统一由中央管理器实现
   _handleUnhealthyCDN(url, failures) {
-    this.failureCount.set(url, failures + 1);
-    if (failures + 1 >= 2) {
-      this.currentIndex = (this.currentIndex + 1) % this.sources.length;
-      this.failureCount.set(url, 0);
-    }
-    return false;
+    return CentralManager.instance.handleCDNFailure(url, failures);
   }
 
+  // 统计更新由中央管理器统一处理
   _updateNetworkMetrics(url, metrics) {
-    this._updateLatencyStats(url, metrics);
-    this._updatePacketLossStats(url, metrics);
-    this._updateHistorySuccessRate(url, metrics);
+    CentralManager.instance.updateNetworkMetrics(url, metrics);
   }
 
-  _updateLatencyStats(url, { avgLatency, minLatency, maxLatency }) {
-    const stats = this.latencyStats.get(url) || { values: [], min: [], max: [] };
-    stats.values.push(avgLatency);
-    if (typeof minLatency === 'number') stats.min.push(minLatency);
-    if (typeof maxLatency === 'number') stats.max.push(maxLatency);
-    if (stats.values.length > 100) stats.values.shift();
-    if (stats.min.length > 100) stats.min.shift();
-    if (stats.max.length > 100) stats.max.shift();
-    this.latencyStats.set(url, stats);
-  }
 
-  _updatePacketLossStats(url, { packetLossRate }) {
-    const stats = this.packetLossStats.get(url) || { values: [] };
-    stats.values.push(packetLossRate);
-    if (stats.values.length > 100) stats.values.shift();
-    this.packetLossStats.set(url, stats);
-  }
 
-  _updateHistorySuccessRate(url, { packetLossRate, avgLatency }) {
-    const history = this.historyStats.get(url) || { total: 0, success: 0 };
-    history.total++;
-    if (packetLossRate < this.thresholds.PACKET_LOSS && avgLatency < this.thresholds.LATENCY) history.success++;
-    history.successRate = history.success / history.total;
-    this.historyStats.set(url, history);
-  }
 
-  _updateStats(type, url, { avgLatency, packetLossRate, minLatency, maxLatency }) {
-    const stats = this[`${type}Stats`].get(url) || { values: [], min: [], max: [] };
-    const value = type === 'latency' ? avgLatency : packetLossRate;
-    stats.values.push(value);
-    if (typeof minLatency === 'number') stats.min.push(minLatency);
-    if (typeof maxLatency === 'number') stats.max.push(maxLatency);
-    if (stats.values.length > 100) stats.values.shift();
-    if (stats.min.length > 100) stats.min.shift();
-    if (stats.max.length > 100) stats.max.shift();
-    this[`${type}Stats`].set(url, stats);
-  }
 
-  _updateHistoryStats(url, { avgLatency, packetLossRate }) {
-    const history = this.historyStats.get(url) || { total: 0, success: 0 };
-    history.total++;
-    if (packetLossRate < this.packetLossThreshold && avgLatency < this.latencyThreshold) history.success++;
-    history.successRate = history.success / history.total;
-    this.historyStats.set(url, history);
-  }
+
+
+
+
+
 
   _updateDynamicWeights() {
-    // 智能调度核心算法
-    this.nodeStats = new Map();
-    this.trafficPatterns = new Map();
-    this.historyWindow = 24 * 60 * 60 * 1000;
-
-    this._detectPeriodicity = (data) => {
-      const Fs = 1000; // 采样频率1Hz
-      const N = data.length;
-      const freqs = new Float32Array(N/2);
-      
-      // 傅里叶变换核心算法
-      for(let k=0; k<N/2; k++){
-        let re = 0, im = 0;
-        for(let n=0; n<N; n++){
-          const angle = 2*Math.PI*k*n/N;
-          re += data[n] * Math.cos(angle);
-          im -= data[n] * Math.sin(angle);
-        }
-        freqs[k] = Math.hypot(re, im)/N;
-      }
-      
-      // 寻找主导频率
-      const maxIndex = freqs.indexOf(Math.max(...freqs));
-      return {
-        period: Math.round((N/2)/(maxIndex || 1)*1000), // 转换为毫秒
-        confidence: freqs[maxIndex]/freqs.reduce((a,b)=>a+b,0)
-      };
-    };
-
-    this._clusterGeoData = (data) => {
-      /* 地理空间聚类分析 */
-      return { clusters: 3, centroid: [114.08, 22.54] };
-    };
-
-    this.predictNodePerformance = (url) => {
-      const stats = this.latencyStats.get(url) || {};
-      return {
-        loadScore: Math.min(1, stats.avgLatency / 500),
-        stability: 1 - (stats.packetLoss.avg || 0),
-        predictedThroughput: 1/(stats.avgLatency || 1) * 1000
-      };
-    };
-
-    this.stabilityWeights.latency *= this._getTrafficFactor('latency');
-    this.stabilityWeights.packetLoss *= this._getTrafficFactor('loss');
+    // 权重计算已由CentralManager统一处理
+    return CentralManager.instance.calculateDynamicWeights();
   }
 
   _getTrafficFactor(type) {
