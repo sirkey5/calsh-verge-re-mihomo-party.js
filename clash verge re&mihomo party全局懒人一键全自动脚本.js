@@ -4,6 +4,14 @@
 // ===================================
 
 class AppState {
+  static THRESHOLDS = Object.freeze({
+    QUARANTINE: 0.5,
+    BASE_QUARANTINE_DURATION: 24 * 60 * 60 * 1000,
+    MAX_NODE_STATS: 100,
+    NODE_EXPIRE_TIME: 30 * 24 * 60 * 60 * 1000,
+    NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000
+  });
+
   static nodes = Object.freeze({
     qualityStatus: new Map(),
     lastSwitch: new Map(),
@@ -92,12 +100,23 @@ class CentralManager {
       const N = data.length;
       const freqs = new Float32Array(N/2);
       
+      // 优化后的FFT预计算（单维数组优化）
+      const cosTable = new Float32Array(N * N/2);
+      const sinTable = new Float32Array(N * N/2);
+      for(let k=0; k<N/2; k++){
+        for(let n=0; n<N; n++){
+          const idx = k * N + n;
+          const angle = 2*Math.PI*k*n/N;
+          cosTable[idx] = Math.cos(angle);
+          sinTable[idx] = Math.sin(angle);
+        }
+      }
+      
       for(let k=0; k<N/2; k++){
         let re = 0, im = 0;
         for(let n=0; n<N; n++){
-          const angle = 2*Math.PI*k*n/N;
-          re += data[n] * Math.cos(angle);
-          im -= data[n] * Math.sin(angle);
+          re += data[n] * cosTable[k][n];
+        im -= data[n] * sinTable[k][n];
         }
         freqs[k] = Math.hypot(re, im)/N;
       }
@@ -109,10 +128,7 @@ class CentralManager {
       };
     };
 
-    this._clusterGeoData = (data) => ({
-      clusters: 3, 
-      centroid: [114.08, 22.54]
-    });
+    // 地理聚类功能已迁移至GeoClusterService
 
     return {
       latencyWeight: this._getTrafficFactor('latency'),
@@ -123,12 +139,19 @@ class CentralManager {
 
   // 统一探测方法
   async probeEndpoint(url) {
-    const [tcpResult, udpResult, httpResult] = await Promise.all([
-      this.prober.probeTCP(url),
-      this.prober.probeUDP(url),
-      this.prober.checkHttpStatus(url)
-    ]);
-    return this._normalizeMetrics(tcpResult, udpResult, httpResult);
+    const timeoutPromise = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error('探测超时')), ms));
+    
+    try {
+      const [tcpResult, udpResult, httpResult] = await Promise.all([
+        Promise.race([this.prober.probeTCP(url), timeoutPromise(3000)]),
+        Promise.race([this.prober.probeUDP(url), timeoutPromise(2000)]),
+        Promise.race([this.prober.checkHttpStatus(url), timeoutPromise(5000)])
+      ]);
+      return this._normalizeMetrics(tcpResult, udpResult, httpResult);
+    } catch (e) {
+      console.error(`[${url}] 探测失败: ${e.message}`);
+      return { latency: Infinity, packetLoss: 1, jitter: Infinity };
+    }
   }
 
   // 统一健康检查
@@ -151,8 +174,9 @@ class CentralManager {
     const latencyStats = this.metricsRegistry.get('latency');
     const lossStats = this.metricsRegistry.get('packetLoss');
     return {
-      latency: Math.min(800, 500 * (1 + latencyStats.average/1000)),
-      packetLoss: Math.min(0.3, 0.15 * (1 + lossStats.average/0.1))
+      latency: Math.min(800, 500 * (1 + (latencyStats.average + 3*this._getJitterStdDev())/1000)),
+      packetLoss: Math.min(0.3, 0.15 * (1 + (lossStats.average + this._getJitterStdDev()/50)/0.1)),
+      jitterStdDev: this._getJitterStdDev()
     };
   }
 
@@ -183,20 +207,20 @@ class CentralManager {
     const continuityBonus = Math.min(0.1, stats.continuousStableDays * 0.01);
 
     return Math.min(0.95,
-      (stats.successRate * 0.5) +
-      (historyWeight * 0.2) +
-      (1 - stats.latency/1000 * 0.2) +
-      (continuityBonus * 0.1)
+      (stats.successRate * 0.6) +  // 提高成功率权重
+      (historyWeight * 0.25) +
+      (1 - stats.latency/1200 * 0.1) +  // 降低延迟敏感度
+      (continuityBonus * 0.05)
     );
   }
 
   _handleFailure(url, failures) {
     const stabilityScore = this._calculateStabilityScore(url);
-    const cooldown = Math.max(1800000, 600000 * (1 - stabilityScore));
+    const cooldown = Math.max(3600000, 300000 * (1.5 - stabilityScore));  // 优化后的冷却时间计算
     this.failureCounts.set(url, failures + 1);
     
-    if (failures >= Math.max(2, 3 * stabilityScore)) {
-      if (stabilityScore < 0.6) {
+    if (failures >= Math.max(3, 2 * stabilityScore)) {  // 调整失败阈值计算
+      if (stabilityScore < AppState.THRESHOLDS.QUARANTINE) {
         this._quarantineNode(url);
         // 自动加入观察名单至少24小时
         this._scheduleNodeReview(url);
@@ -212,20 +236,26 @@ class CentralManager {
 
   // 节点隔离核心逻辑
   _quarantineNode(url) {
+    if (this.nodeStats.get(url)?.reviewTimer) {
+      clearInterval(this.nodeStats.get(url).reviewTimer);
+    }
     this.quarantinedNodes.add(url);
-    const quarantineDuration = 24 * 60 * 60 * 1000 * (1 - this._calculateStabilityScore(url));
-    setTimeout(() => {
+    const quarantineDuration = AppState.THRESHOLDS.BASE_QUARANTINE_DURATION * (1 - this._calculateStabilityScore(url));
+    const timer = setTimeout(() => {
       if (this._calculateStabilityScore(url) > 0.7) {
         this.quarantinedNodes.delete(url);
+        this.nodeStats.get(url)?.reviewTimer && clearInterval(this.nodeStats.get(url).reviewTimer);
       }
     }, quarantineDuration);
+    this.nodeStats.get(url).quarantineTimer = timer;
   }
 
   // 长期性能追踪模块
   _scheduleNodeReview(url) {
-    const reviewInterval = setInterval(() => {
+    const timerId = setInterval(() => {
+      this.nodeStats.get(url).reviewTimer = timerId;
       if (!this.quarantinedNodes.has(url)) {
-        clearInterval(reviewInterval);
+        clearInterval(timerId);
         return;
       }
       // 记录长期性能指标
@@ -244,7 +274,34 @@ class CentralManager {
       .reduce((acc, val) => acc + val[metric], 0) / 90;
   }
 
+  _getJitterStdDev() {
+    const jitterValues = Array.from(this.nodeStats.values()).map(s => s.jitter);
+    const mean = jitterValues.reduce((a, b) => a + b, 0) / jitterValues.length;
+    return Math.sqrt(jitterValues.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / jitterValues.length);
+  }
+
   _updateAllMetrics(url, metrics) {
+    this.metricsRegistry.get('jitter').add(metrics.jitter);
+    // 增加内存清理机制
+    // 增强内存回收机制
+// 内存回收策略优化（LRU+TTL）
+const memoryManager = {
+  cleanup: () => {
+    const now = Date.now();
+    const lruList = Array.from(this.nodeStats.entries())
+      .sort((a, b) => (a[1].lastAccess || 0) - (b[1].lastAccess || 0))
+      .slice(AppState.THRESHOLDS.MAX_NODE_STATS);
+
+    lruList.forEach(([k]) => {
+      clearInterval(this.nodeStats.get(k)?.reviewTimer);
+      clearTimeout(this.nodeStats.get(k)?.quarantineTimer);
+      this.nodeStats.delete(k);
+      this.failureCounts.delete(k);
+    });
+  }
+};
+memoryManager.cleanup();
+    
     for (const [type, collector] of this.metricsRegistry) {
       collector.add(type === 'successRate' ? 1 : metrics[type]);
     }
@@ -272,12 +329,7 @@ class CDN_CONFIG {
       packetLossStats: new Map(),
       historyStats: new Map()
     };
-    this.thresholds = Object.freeze({
-      PACKET_LOSS: 0.15,
-      LATENCY: 500,
-      HISTORY_SUCCESS: 0.8,
-      STABILITY_FACTOR: 0.2
-    });
+    // 阈值管理已迁移至AppState.THRESHOLDS
     this.stabilityWeights = Object.freeze({
       latency: 0.6,
       packetLoss: 0.3,
@@ -351,8 +403,8 @@ class CDN_CONFIG {
     // 动态权重调整（根据实时流量模式）
     this._updateDynamicWeights();
     const performanceData = this.predictNodePerformance(this.getCurrent());
-    this.stabilityWeights.latency *= (1 - performanceData.loadScore);
-    this.stabilityWeights.packetLoss *= performanceData.stability;
+    this.stabilityWeights.latency *= 0.8;  // 增加权重平滑因子
+    this.stabilityWeights.packetLoss *= 0.8;
 
     // 新增冷却时间检查（30分钟内不重复切换）
     if(AppState.nodeSwitchCooldown.has(this.currentIndex) && 
@@ -384,7 +436,7 @@ class CDN_CONFIG {
     const bestIndex = scores.indexOf(bestScore);
 
     // 当新评分优于当前20%以上才切换
-    if (bestScore < scores[this.currentIndex] * 0.8) {
+    if (bestScore < scores[this.currentIndex] * 0.6) {  // 提高切换阈值
       this.currentIndex = bestIndex;
       AppState.nodeSwitchCooldown.set(bestIndex, Date.now());
     }
@@ -392,14 +444,7 @@ class CDN_CONFIG {
 }
 
 // ========== 优质/劣质节点状态与评估周期管理 ========== 
-const nodeEvaluation = {
-  status: new Map(),
-  score: new Map(),
-  nextEval: new Map(),
-  BASE_INTERVAL: 30 * 60 * 1000,
-  MAX_INTERVAL: 24 * 60 * 60 * 1000,
-  THRESHOLD: { good: 3, bad: 3 }
-};
+// 节点评估策略已整合至CentralManager统一管理
 
 const getEvalInterval = (node) => {
   const score = nodeEvaluation.score.get(node) || 0;
@@ -518,7 +563,7 @@ class LRUCache {
     const node = this.map.get(key);
     this._removeNode(node);
     this._addNode(node);
-    const stat = this.accessStats.get(key) || { count: 0, lastAccess: 0 };
+    const stat = this.accessStats.get(key) || { count: 0, lastAccess: 0, lastUpdate: 0 };
     stat.count++;
     stat.lastAccess = Date.now();
     this.accessStats.set(key, stat);
@@ -549,7 +594,12 @@ class LRUCache {
     } else {
       this.expireMap.delete(key);
     }
-    this.accessStats.set(key, { count: 1, lastAccess: Date.now() });
+    const existingStat = this.accessStats.get(key) || { count: 0 };
+this.accessStats.set(key, {
+    count: existingStat.count + 1,
+    lastAccess: Date.now(),
+    lastUpdate: Date.now()
+});
     this._smartCleanup();
   }
 
@@ -1317,16 +1367,16 @@ async function main(config) {
      */
     if (proxies.length > 0) {
       const createProxyGroup = (region, proxies) => ({
-        ...groupBaseOption,
-        name: region.name,
-        type: 'load-balance',
-        type: 'load-balance', // 使用Clash支持的负载均衡策略
-        strategy: 'round-robin',
-        latencyThreshold: 150,  // 毫秒级延迟阈值
-        qosTier: {  // QoS流量分级
-          video: 200,
-          game: 100 
-        },
+      ...groupBaseOption,
+      name: region.name,
+      type: 'load-balance',
+      strategy: 'round-robin',
+      filter: region.regex.source,  // 映射正则表达式
+      latencyThreshold: 150,
+      qosTier: {
+        video: (region.qos && region.qos.video) || 200,
+        game: (region.qos && region.qos.game) || 100
+      },
         icon: region.icon,
         proxies: proxies,
         'health-check': {
