@@ -7,7 +7,7 @@ class AppState {
   static THRESHOLDS = Object.freeze({
     QUARANTINE: 0.5,
     BASE_QUARANTINE_DURATION: 24 * 60 * 60 * 1000,
-    MAX_NODE_STATS: 100,
+    
     NODE_EXPIRE_TIME: 30 * 24 * 60 * 60 * 1000,
     NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000
   });
@@ -24,25 +24,51 @@ class AppState {
 }
 
 class RollingStats {
-  constructor(windowSize = 100) {
-    this.values = [];
-    this.windowSize = windowSize;
+  constructor() {
+    this.fullWindow = [];
+    this.sampledWindow = [];
+    this.sampleCounter = 0;
   }
 
   add(value) {
-    this.values.push(value);
-    if (this.values.length > this.windowSize) {
-      this.values.shift();
+    // 全量存储最近100条
+    this.fullWindow.push(value);
+    if (this.fullWindow.length > 100) {
+      this.fullWindow.shift();
+    }
+
+    // 每10条采样1条存储900条
+    if (++this.sampleCounter % 10 === 0) {
+      this.sampledWindow.push(value);
+      if (this.sampledWindow.length > 900) {
+        this.sampledWindow.shift();
+      }
     }
   }
 
   get average() {
-    return this.values.reduce((a, b) => a + b, 0) / this.values.length || 0;
+    return this._weightedAverage();
+  }
+
+  _weightedAverage() {
+    const fullWeight = 0.7;
+    const sampledWeight = 0.3;
+    
+    const fullSum = this.fullWindow.reduce((a, b) => a + b, 0);
+    const sampledSum = this.sampledWindow.reduce((a, b) => a + b, 0);
+    
+    return (fullSum * fullWeight / Math.max(1, this.fullWindow.length)) + 
+           (sampledSum * sampledWeight / Math.max(1, this.sampledWindow.length));
+  }
+
+  get recentData() {
+    return [...this.fullWindow, ...this.sampledWindow];
   }
 }
 
 class SuccessRateTracker {
   constructor() {
+    this.currentPremiumNode = null; // 当前优质节点标记
     this.successes = 0;
     this.total = 0;
   }
@@ -75,9 +101,15 @@ class CentralManager {
   static instance = new this();
   constructor() {
     this.manager = CentralManager.instance;
+    // Placeholder for Prober, replace with actual implementation
+    this.prober = {
+      probeTCP: async (url) => ({ avgLatency: 200, packetLossRate: 0, jitter: 10 }),
+      probeUDP: async (url) => ({ avgLatency: 200, packetLossRate: 0, jitter: 10 }),
+      checkHttpStatus: async (url) => ({ statusCode: 200 })
+    };
     this.metricsRegistry = new Map([
-      ['latency', new RollingStats(100)],
-      ['packetLoss', new RollingStats(100)],
+      ['latency', new RollingStats()],
+      ['packetLoss', new RollingStats()],
       ['successRate', new SuccessRateTracker()]
     ]);
     this.cdnPool = [
@@ -94,60 +126,118 @@ class CentralManager {
   }
 
   calculateDynamicWeights() {
-    // 迁移智能调度核心算法
-    this._detectPeriodicity = (data) => {
-      const Fs = 1000;
-      const N = data.length;
-      const freqs = new Float32Array(N/2);
-      
-      // 优化后的FFT预计算（单维数组优化）
-      const cosTable = new Float32Array(N * N/2);
-      const sinTable = new Float32Array(N * N/2);
-      for(let k=0; k<N/2; k++){
-        for(let n=0; n<N; n++){
-          const idx = k * N + n;
-          const angle = 2*Math.PI*k*n/N;
-          cosTable[idx] = Math.cos(angle);
-          sinTable[idx] = Math.sin(angle);
-        }
-      }
-      
-      for(let k=0; k<N/2; k++){
-        let re = 0, im = 0;
-        for(let n=0; n<N; n++){
-          re += data[n] * cosTable[k][n];
-        im -= data[n] * sinTable[k][n];
-        }
-        freqs[k] = Math.hypot(re, im)/N;
-      }
-      
-      const maxIndex = freqs.indexOf(Math.max(...freqs));
-      return {
-        period: Math.round((N/2)/(maxIndex || 1)*1000),
-        confidence: freqs[maxIndex]/freqs.reduce((a,b)=>a+b,0)
-      };
-    };
-
-    // 地理聚类功能已迁移至GeoClusterService
-
+    // 智能调度核心算法
     return {
       latencyWeight: this._getTrafficFactor('latency'),
       lossWeight: this._getTrafficFactor('loss'),
-      successWeight: 1 - (this._getTrafficFactor('latency') + this._getTrafficFactor('loss'))/2
+      successWeight: 1 - (this._getTrafficFactor('latency') + this._getTrafficFactor('loss')) / 2
     };
   }
 
-  // 统一探测方法
+  _getTrafficFactor(metricType) {
+    // Placeholder implementation for traffic factor calculation
+    // This should be replaced with actual logic based on traffic patter    const trafficData = this.trafficPatterns.get(metricType) || [];
+    // 增加成功率趋势分析
+const successPatterns = this.trafficPatterns.get('success') || [];
+const successTrend = successPatterns.length > 3 
+  ? successPatterns.slice(-3).reduce((a,b) => a + (b > 0.8 ? 1 : -1), 0)
+  : 0;
+
+if (trafficData.length < 5) {
+  return successTrend > 0 ? 0.28 : 0.38; // 根据成功趋势调整默认权重
+}
+
+    // Simulate a more concrete logic: analyze the trend of the last 5 data points
+    const recentData = trafficData.slice(-5);
+    const averageRecent = recentData.reduce((a, b) => a + b, 0) / recentData.length;
+    const averageOverall = trafficData.reduce((a, b) => a + b, 0) / trafficData.length;
+
+    let factor = 0.33; // Base factor
+
+    // If recent average is significantly higher than overall, increase weight for that metric
+    if (averageRecent > averageOverall * 1.2) {
+      factor = 0.45;
+    } else if (averageRecent < averageOverall * 0.8) {
+      factor = 0.20;
+    }
+
+    // Specific adjustments based on metric type
+    if (metricType === 'latency') {
+      // If latency is trending up, prioritize it more
+      return trafficData[trafficData.length -1] > trafficData[trafficData.length -2] ? Math.min(0.5, factor + 0.1) : Math.max(0.2, factor - 0.05);
+    }
+    if (metricType === 'loss') {
+      // If packet loss is trending up, prioritize it more
+      return trafficData[trafficData.length -1] > trafficData[trafficData.length -2] ? Math.min(0.5, factor + 0.15) : Math.max(0.15, factor - 0.05);
+    }
+    // 增加网络质量衰减系数
+const qualityDecay = Math.exp(-Date.now()/this.historyWindow);
+return Math.max(0.1, Math.min(0.6, factor * (0.9 + qualityDecay*0.2)));
+  }
+
+  /**
+   * 统一探测方法，结合TCP、UDP和HTTP探测来评估端点质量。
+   * 动态调整探测超时时间基于网络状况（RTT、抖动）。
+   * @param {string} url - 需要探测的端点URL。
+   * @returns {Promise<object>} 包含延迟、丢包率、抖动等指标的对象；若探测失败则返回高延迟和丢包率。
+   */
   async probeEndpoint(url) {
-    const timeoutPromise = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error('探测超时')), ms));
+    let timeoutPromise = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error('探测超时')), ms));
     
     try {
-      const [tcpResult, udpResult, httpResult] = await Promise.all([
-        Promise.race([this.prober.probeTCP(url), timeoutPromise(3000)]),
-        Promise.race([this.prober.probeUDP(url), timeoutPromise(2000)]),
-        Promise.race([this.prober.checkHttpStatus(url), timeoutPromise(5000)])
-      ]);
+      // 基础超时时间计算：基于平均延迟和抖动标准差动态调整，确保在1秒到5秒之间。
+      const avgLatency = (this.metricsRegistry.get('latency') && this.metricsRegistry.get('latency').average) || 200; // Default to 200ms if no data
+      const jitterStdDev = this._getJitterStdDev(); // Already handles empty/invalid data
+      // 引入动态衰减因子和网络质量系数
+const networkQualityFactor = Math.min(2, Math.max(0.5, 
+  (1 - this.metricsRegistry.get('packetLoss').average) * 
+  (1 / (1 + Math.log(avgLatency/100 + 1)))
+));
+const baseTimeout = Math.min(3000, Math.max(800, 
+  (avgLatency * 1.5 + jitterStdDev * 2) * networkQualityFactor
+));
+
+      // RTT值和统计计算，用于后续的动态超时调整和EMA滤波
+      const rttValues = (this.metricsRegistry.get('latency') && this.metricsRegistry.get('latency').values) || [];
+      const meanRTT = rttValues.length > 0 ? rttValues.reduce((a, b) => a + b, 0) / rttValues.length : avgLatency;
+      const rttStdDevCalc = rttValues.length > 1 ? Math.sqrt(rttValues.reduce((a, x) => a + Math.pow(x - meanRTT, 2), 0) / rttValues.length) : 0;
+      // const volatilityFactor = 1 + (rttStdDevCalc / (meanRTT || 1)); // meanRTT can't be 0 if rttValues exist
+
+      // 改进的EMA滤波（α动态调整），用于平滑RTT值，减少短期波动影响
+      // dynamicAlpha: 动态调整平滑因子，抖动越大，越依赖历史数据（alpha越小）
+      // 自适应平滑系数，结合网络抖动和成功率
+const successRate = this.metricsRegistry.get('successRate').rate;
+const dynamicAlpha = Math.min(0.35, Math.max(0.15, 
+  0.25 - (rttStdDevCalc / 60) + (1 - successRate) * 0.1
+));
+      const smoothedRTT = rttValues.length > 0 
+        ? rttValues.reduce((acc, cur) => acc * (1 - dynamicAlpha) + cur * dynamicAlpha, rttValues[0])
+        : avgLatency;
+
+    // 执行TCP, UDP, HTTP探测，每个探测都有其独立的、基于平滑RTT和抖动调整的超时时间
+    // TCP探测超时：基础超时 * 1.2 * sqrt(平滑RTT/基准RTT)，更容忍网络波动
+    // UDP探测超时：基础超时 * 0.8 * sqrt(平滑RTT/基准RTT) * (1 + RTT标准差/基准RTT)，对UDP的快速响应有更高要求，但考虑抖动
+    // HTTP探测超时：基础超时 * 2，通常HTTP请求涉及更多处理，给予更长时间
+    const tcpTimeout = baseTimeout * 1.2 * Math.sqrt(Math.max(50, smoothedRTT) / 200); // Ensure smoothedRTT is not too small
+    const udpTimeout = baseTimeout * 0.8 * Math.sqrt(Math.max(50, smoothedRTT) / 200) * (1 + rttStdDevCalc / 200);
+    const httpTimeout = baseTimeout * 2;
+
+    const [tcpResult, udpResult, httpResult] = await Promise.all([
+      Promise.race([this.prober.probeTCP(url), timeoutPromise(tcpTimeout)]),
+      Promise.race([this.prober.probeUDP(url), timeoutPromise(udpTimeout)]),
+      Promise.race([this.prober.checkHttpStatus(url), timeoutPromise(httpTimeout)])
+    ]);
+
+    // 增强的协议一致性校准：比较TCP和UDP探测结果的抖动和延迟差异
+    // calibrationFactor: 校准因子，一致性越高，因子越接近1，对后续超时影响小；差异大则因子减小，可能缩短超时（暂未使用，原逻辑有误导）
+
+
+    // 更新timeoutPromise的逻辑已移除，因为它在当前promise链之后，不会影响已执行的探测
+    // 若要动态调整后续操作的超时，应在需要时重新创建timeoutPromise实例或传递校准后的超时值
+
+
       return this._normalizeMetrics(tcpResult, udpResult, httpResult);
+
     } catch (e) {
       console.error(`[${url}] 探测失败: ${e.message}`);
       return { latency: Infinity, packetLoss: 1, jitter: Infinity };
@@ -160,12 +250,24 @@ class CentralManager {
     try {
       const metrics = await this.probeEndpoint(url);
       if (this._isUnhealthy(metrics)) {
-        return this._handleFailure(url, failures);
+        // 实时网络质量评估
+const currentMetrics = this.metricsRegistry.get('latency').values.slice(-3);
+const networkScore = currentMetrics.length > 0 
+  ? currentMetrics.reduce((a, b) => a + b, 0) / currentMetrics.length 
+  : Infinity;
+
+return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, failures);
       }
       this._updateAllMetrics(url, metrics);
       return true;
     } catch (e) {
-      return this._handleFailure(url, failures);
+      // 实时网络质量评估
+const currentMetrics = this.metricsRegistry.get('latency').values.slice(-3);
+const networkScore = currentMetrics.length > 0 
+  ? currentMetrics.reduce((a, b) => a + b, 0) / currentMetrics.length 
+  : Infinity;
+
+return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, failures);
     }
   }
 
@@ -195,330 +297,441 @@ class CentralManager {
            metrics.packetLoss > thresholds.packetLoss;
   }
 
-  _calculateStabilityScore(url) {
-    const stats = this.nodeStats.get(url) || { successRate: 0.9, latency: 300, historicalSuccess: [] };
-    
-    // 增加90天历史成功率权重（指数衰减算法）
-    const historyWeight = stats.historicalSuccess
-      .slice(-90)
-      .reduce((acc, val, idx) => acc + val * Math.pow(0.95, idx), 0) * 0.25;
+  /**
+   * 计算节点的历史成功率权重。
+   * @param {object} stats - 节点统计信息。
+   * @returns {number} 历史成功率权重。
+   */
+  _calculateHistoricalSuccessWeight(stats) {
+    const windowSize = Math.min(90, Math.max(30, Math.round(60 * (1 - (stats.latency || 300) / 1000))));
+    const decayRate = Math.min(0.98, Math.max(0.9, 0.95 - ((stats.latency || 300) / 2000)));
+    const historicalSuccess = stats.historicalSuccess || [];
+    return historicalSuccess
+      .slice(-windowSize)
+      .reduce((acc, val, idx) => acc + val * Math.pow(decayRate, idx * (1 - (stats.successRate || 0.9))), 0) * 0.1; // Reduced weight
+  }
 
-    // 增加节点连续稳定天数奖励
-    const continuityBonus = Math.min(0.1, stats.continuousStableDays * 0.01);
+  /**
+   * 计算节点的连续稳定天数奖励。
+   * @param {object} stats - 节点统计信息。
+   * @returns {number} 连续稳定天数奖励。
+   */
+  _calculateContinuityBonus(stats) {
+    return Math.min(0.1, (stats.continuousStableDays || 0) * 0.01);
+  }
+
+  /**
+   * 计算节点的时间衰减因子。
+   * @param {object} stats - 节点统计信息。
+   * @returns {number} 时间衰减因子。
+   */
+  _calculateTimeDecayFactor(stats) {
+    const lastAccessTime = stats.lastAccessTime || Date.now();
+    return Math.exp(-(Date.now() - lastAccessTime) / (30 * 24 * 60 * 60 * 1000));
+  }
+
+  /**
+   * 计算节点的网络质量因子。
+   * @param {object} stats - 节点统计信息。
+   * @returns {number} 网络质量因子。
+   */
+  _calculateNetworkQualityFactor(stats) {
+    const jitterStats = this.metricsRegistry.get('jitter');
+    const currentJitter = (stats.jitter !== undefined && isFinite(stats.jitter)) ? stats.jitter : (jitterStats ? jitterStats.average : 0);
+    return Math.min(1.2, 1 + (currentJitter / 50));
+  }
+
+  _calculateStabilityScore(url) {
+    const stats = this.nodeStats.get(url) || { successRate: 0.9, latency: 300, packetLoss: 0, jitter: 0, historicalSuccess: [], continuousStableDays: 0, lastAccessTime: Date.now() };
+
+    const historyWeight = this._calculateHistoricalSuccessWeight(stats);
+    const continuityBonus = this._calculateContinuityBonus(stats);
+    // 增强时间衰减因子：90天数据半衰期 + 动态衰减系数
+const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Date.now())) / (90 * 86400000)) * 
+  (0.9 - (stats.historicalSuccess.length > 100 ? 0.15 : 0));
+    const networkQualityFactor = this._calculateNetworkQualityFactor(stats);
+
+    const successRateComponent = (stats.successRate || 0.9) * 0.6 * networkQualityFactor;
+    const latencyComponent = Math.exp(-(stats.latency || 300) / 800) * 0.15 * timeDecayFactor;
+    const packetLossComponent = (1 - (stats.packetLoss || 0)) * 0.1;
+
+    // Incorporate real-time latency, packet loss, and success rate with adjusted weights
+    // 自动标记优质节点
+    // 统一优质节点标记条件
+    const isPremiumCandidate = (successRateComponent > 0.85 && latencyComponent > 0.8 && packetLossComponent > 0.9) || 
+      (successRateComponent + latencyComponent + packetLossComponent > 2.4);
+    
+    if (isPremiumCandidate && !this.currentPremiumNode) {
+      this.currentPremiumNode = {
+        url,
+        score: successRateComponent + latencyComponent + packetLossComponent,
+        timestamp: Date.now(),
+        stability: networkQualityFactor
+      };
+      console.log(`[优质节点标记] ${url} 综合评分${this.currentPremiumNode.score.toFixed(2)}`);
+    }
 
     return Math.min(0.95,
-      (stats.successRate * 0.6) +  // 提高成功率权重
-      (historyWeight * 0.25) +
-      (1 - stats.latency/1200 * 0.1) +  // 降低延迟敏感度
-      (continuityBonus * 0.05)
+      successRateComponent +      // Increased weight
+      historyWeight +             // Adjusted weight already applied above
+      latencyComponent +          // Increased weight
+      packetLossComponent +       // Added packet loss factor
+      continuityBonus             // Adjusted weight already applied above
     );
   }
 
+  /**
+   * 处理探测失败或节点不健康的情况。
+   * 根据失败次数和节点稳定性评分决定是增加失败计数、切换CDN还是隔离节点。
+   * @param {string} url - 发生故障的节点URL。
+   * @param {number} failures - 当前节点的连续失败次数。
+   * @returns {boolean} 固定返回false，表示处理失败。
+   */
   _handleFailure(url, failures) {
+    // 优质节点保护机制
+    const newScore = this._calculateStabilityScore(url);
+    if (this.currentPremiumNode && newScore < this.currentPremiumNode.score * 1.5) {
+      console.log(`[优质节点保护] 新节点评分${newScore}未达阈值（需${this.currentPremiumNode.score * 1.5}），保持当前节点`);
+      return false;
+    }
+    // 优质节点保护前置检查
+    if (this.currentPremiumNode && !this._isNodeFaulty(this.currentPremiumNode.url)) {
+      const currentScore = this._calculateStabilityScore(this.currentPremiumNode.url);
+      const candidateScore = this._calculateStabilityScore(url);
+      
+      if (candidateScore < currentScore * 1.5) {
+        console.log(`[节点保护] 候选节点评分${candidateScore}未达阈值（需${currentScore * 1.5}），禁止切换`);
+        return false;
+      }
+    }
+
+    // 新增TCP连接池状态检查
+    if(this.connectionPool?.hasIdleConnections()) {
+      this.connectionPool.releaseFailedConnection(url);
+    }
     const stabilityScore = this._calculateStabilityScore(url);
-    const cooldown = Math.max(3600000, 300000 * (1.5 - stabilityScore));  // 优化后的冷却时间计算
+    
+
+    // 冷却时间计算：基础冷却时间（至少1小时）加上基于稳定性评分调整的部分。
+    // 稳定性越低，(1.5 - stabilityScore)越大，额外冷却时间越长。
+    const baseCooldown = 300000; // 5 minutes base for switch, quarantine has its own duration logic
+    const nodeSpecificCooldown = Math.max(3600000, baseCooldown * (1.5 - stabilityScore)); // Min 1 hour for quarantine consideration, or dynamic for switch
+
     this.failureCounts.set(url, failures + 1);
     
-    if (failures >= Math.max(3, 2 * stabilityScore)) {  // 调整失败阈值计算
-      if (stabilityScore < AppState.THRESHOLDS.QUARANTINE) {
+    // 失败阈值：至少3次失败，或者失败次数达到稳定性评分的两倍（评分低则更容易达到阈值）。
+    const failureThreshold = Math.max(3, Math.floor(2 / Math.max(0.1, stabilityScore))); // Inverse relationship with stability score for threshold
+
+    if (failures + 1 >= failureThreshold) { 
+      if (stabilityScore < (AppState.THRESHOLDS.QUARANTINE || 0.5)) {
+        // 稳定性评分低于隔离阈值，则隔离节点并安排审查。
         this._quarantineNode(url);
-        // 自动加入观察名单至少24小时
-        this._scheduleNodeReview(url);
+        this._scheduleNodeReview(url); // Schedule for long-term review
       } else {
+        // 未达到隔离条件，则切换到下一个CDN，并重置失败计数。
+        // 设置切换冷却时间，避免过于频繁的切换。
         this.activeIndex = (this.activeIndex + 1) % this.cdnPool.length;
-        this.failureCounts.set(url, 0);
-        const cooldownFactor = 1 + (1 - stabilityScore) * 3;
-        AppState.nodeSwitchCooldown.set(this.activeIndex, Date.now() + cooldown * cooldownFactor);
+        this.failureCounts.set(url, 0); // Reset failures for the failing node as we are switching away
+        
+        // Cooldown for the *newly selected* activeIndex to prevent immediate switch-back or rapid cycling
+        const switchCooldownDuration = baseCooldown * (1 + (1 - this._calculateStabilityScore(this.cdnPool[this.activeIndex])) * 3); // Cooldown based on new node's stability
+        AppState.nodes.switchCooldown.set(this.cdnPool[this.activeIndex], Date.now() + switchCooldownDuration);
       }
     }
     return false;
   }
 
-  // 节点隔离核心逻辑
+  /**
+   * 节点隔离核心逻辑。
+   * 将节点加入隔离区，设置基于其稳定性的隔离持续时间，并清除其审查定时器。
+   * @param {string} url - 需要隔离的节点URL。
+   */
   _quarantineNode(url) {
-    if (this.nodeStats.get(url)?.reviewTimer) {
-      clearInterval(this.nodeStats.get(url).reviewTimer);
+    const nodeStat = this.nodeStats.get(url) || {}; // Ensure nodeStat is an object
+    if (nodeStat.reviewTimer) {
+      clearInterval(nodeStat.reviewTimer);
+      nodeStat.reviewTimer = null; // Clear timer ID
     }
     this.quarantinedNodes.add(url);
-    const quarantineDuration = AppState.THRESHOLDS.BASE_QUARANTINE_DURATION * (1 - this._calculateStabilityScore(url));
+    // 隔离持续时间：基础隔离时间乘以 (1 - 稳定性评分)。评分越低，隔离时间越长。
+    const stabilityScore = this._calculateStabilityScore(url);
+    
+
+    const baseQuarantineDuration = (AppState.THRESHOLDS.BASE_QUARANTINE_DURATION || (24 * 60 * 60 * 1000));
+    const quarantineDuration = baseQuarantineDuration * Math.max(0.1, (1 - stabilityScore)); // Ensure some minimum duration factor
+
+    // 设置定时器，在隔离期满后检查节点是否恢复，若恢复则移出隔离区。
     const timer = setTimeout(() => {
-      if (this._calculateStabilityScore(url) > 0.7) {
+      // Re-calculate score at the end of quarantine
+      if (this._calculateStabilityScore(url) > (AppState.THRESHOLDS.QUARANTINE_EXIT_SCORE || 0.7)) { // Use a configurable exit score
         this.quarantinedNodes.delete(url);
-        this.nodeStats.get(url)?.reviewTimer && clearInterval(this.nodeStats.get(url).reviewTimer);
+        const currentStat = this.nodeStats.get(url);
+        if (currentStat) {
+            // If it had a quarantine timer, it should be this one. Clear it.
+            if (currentStat.quarantineTimer === timer) currentStat.quarantineTimer = null;
+            // Optionally, reschedule review if needed, or let natural health checks take over.
+        }
+      } else {
+        // Node still unhealthy, could extend quarantine or log for manual review
+        console.warn(`[${url}] Node still unhealthy after quarantine period.`);
+        // Optionally, re-schedule another, possibly longer, quarantine period or different handling.
       }
     }, quarantineDuration);
-    this.nodeStats.get(url).quarantineTimer = timer;
+
+    // 存储隔离定时器ID，以便需要时可以清除（例如，手动解除隔离）。
+    nodeStat.quarantineTimer = timer;
+    this.nodeStats.set(url, nodeStat); // Ensure updated stat object is saved
   }
 
-  // 长期性能追踪模块
+  /**
+   * 长期性能追踪模块。
+   * 为被隔离的节点安排定期（每日）审查，记录其长期性能指标。
+   * 如果节点不再被隔离，则停止审查。
+   * @param {string} url - 需要安排审查的节点URL。
+   */
   _scheduleNodeReview(url) {
+    let nodeStat = this.nodeStats.get(url);
+    if (!nodeStat) {
+        nodeStat = {}; // Initialize if not present
+        this.nodeStats.set(url, nodeStat);
+    }
+    // If there's an existing review timer for this node, clear it before setting a new one.
+    if (nodeStat.reviewTimer) {
+        clearInterval(nodeStat.reviewTimer);
+    }
+
+    const reviewInterval = 24 * 60 * 60 * 1000; // Daily review
+
     const timerId = setInterval(() => {
-      this.nodeStats.get(url).reviewTimer = timerId;
+      const currentStat = this.nodeStats.get(url); // Get the latest stat object
+      if (!currentStat) { 
+          clearInterval(timerId); // Node stat somehow removed, stop timer
+          return;
+      }
+      // Ensure the timerId on the stat object is current, in case of multiple calls or race conditions.
+      // This helps in correctly clearing this specific interval later.
+      currentStat.reviewTimer = timerId; 
+
       if (!this.quarantinedNodes.has(url)) {
         clearInterval(timerId);
+        currentStat.reviewTimer = null; // Clear timer ID from stat
+        // this.nodeStats.set(url, currentStat); // Persist change if necessary, though often not needed if only clearing
         return;
       }
       // 记录长期性能指标
-      this.nodeStats.get(url).longTermMetrics = {
+      currentStat.longTermMetrics = {
         avgLatency: this._calculate90DayAverage(url, 'latency'),
         successRate: this._calculate90DayAverage(url, 'successRate'),
         lastReview: Date.now()
       };
-    }, 24 * 60 * 60 * 1000);
+      // this.nodeStats.set(url, currentStat); // Persist updated metrics, if not done implicitly by reference
+    }, reviewInterval);
+    nodeStat.reviewTimer = timerId; // Store initial timerId on the stat object
+    // this.nodeStats.set(url, nodeStat); // Ensure stat object with new timerId is saved
   }
 
+  /**
+   * 计算指定节点在过去90天内某项指标的平均值。
+   * @param {string} url - 节点URL。
+   * @param {string} metric - 需要计算平均值的指标名称 ('latency' 或 'successRate')。
+   * @returns {number} 指标的90天平均值；若无历史数据，成功率默认为1，延迟默认为0。
+   */
   _calculate90DayAverage(url, metric) {
     const stats = this.nodeStats.get(url);
-    return stats.historicalSuccess
-      .slice(-90)
-      .reduce((acc, val) => acc + val[metric], 0) / 90;
+    if (!stats || !stats.historicalSuccess || stats.historicalSuccess.length === 0) {
+      return metric === 'successRate' ? 1 : 0; // Default if no history
+    }
+    // Assuming historicalSuccess contains objects like { latency: X, successRate: Y, ...}
+    // Or if historicalSuccess is an array of numbers for a specific metric, adjust accordingly.
+    // For now, let's assume it's an array of numbers if metric is 'successRate', or objects for others.
+    const relevantHistory = stats.historicalSuccess.slice(-90); // Use fixed 90 days
+    if (relevantHistory.length === 0) {
+        return metric === 'successRate' ? 1 : 0;
+    }
+
+    if (typeof relevantHistory[0] === 'object' && relevantHistory[0] !== null && metric in relevantHistory[0]) {
+        return relevantHistory.reduce((acc, val) => acc + val[metric], 0) / relevantHistory.length;
+    } else if (typeof relevantHistory[0] === 'number' && (metric === 'successRate' || metric === 'latency' /* if historicalSuccess stores raw latency */)) {
+        // If historicalSuccess stores raw numbers for the metric directly
+        return relevantHistory.reduce((acc, val) => acc + val, 0) / relevantHistory.length;
+    }
+    // Fallback or error handling if structure is unexpected
+    console.warn(`[${url}] Unexpected structure in historicalSuccess for metric ${metric}`);
+    return metric === 'successRate' ? 1 : 0;
   }
 
   _getJitterStdDev() {
-    const jitterValues = Array.from(this.nodeStats.values()).map(s => s.jitter);
+    const jitterValues = Array.from(this.nodeStats.values())
+      .map(s => s.jitter)
+      .filter(j => typeof j === 'number' && isFinite(j)); // Filter out non-numeric or non-finite jitter values
+
+    if (jitterValues.length === 0) {
+      return 0; // Default to 0 if no valid jitter data is available
+    }
+
     const mean = jitterValues.reduce((a, b) => a + b, 0) / jitterValues.length;
-    return Math.sqrt(jitterValues.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / jitterValues.length);
+    if (jitterValues.length === 1) {
+        return 0; // Standard deviation is 0 for a single data point
+    }
+    const variance = jitterValues.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / jitterValues.length; // Use N for population variance if all nodes are considered
+    return Math.sqrt(variance);
+  }
+
+  /**
+   * 辅助函数：从节点统计中移除指定节点，并清理相关定时器。
+   * @param {string} key - 要移除的节点的键（URL）。
+   */
+  _removeNodeFromStats(key) {
+    const nodeStat = this.nodeStats.get(key);
+    if (nodeStat) {
+        if (nodeStat.reviewTimer) clearInterval(nodeStat.reviewTimer);
+        if (nodeStat.quarantineTimer) clearTimeout(nodeStat.quarantineTimer);
+    }
+    this.nodeStats.delete(key);
+    this.failureCounts.delete(key); // Also remove from failure counts
+  }
+
+  /**
+   * 管理节点统计数据的内存，采用分代回收策略（LRU+TTL）清理不活跃或过多的节点数据。
+   */
+  _manageMemory() {
+    const now = Date.now();
+    const maxNodeStats = 100; // 固定内存管理阈值
+
+    // 分代回收策略（新生代+老生代）
+    // 新生代：访问次数 <= 3；老生代：访问次数 > 3
+    const [newGen, oldGen] = Array.from(this.nodeStats.entries())
+      .reduce((acc, [key, stats]) => {
+        stats.accessCount = (stats.accessCount || 0) + 1;
+        // Ensure lastAccess is a number for sorting
+        stats.lastAccess = stats.lastAccess || now;
+        if (stats.accessCount > 3) {
+          acc[1].push([key, stats]); // Old generation
+        } else {
+          acc[0].push([key, stats]); // New generation
+        }
+        return acc;
+      }, [[], []]);
+
+    // 清理新生代 (LRU, 清理超出70%限额的部分)
+    if (newGen.length > maxNodeStats * 0.7) {
+        newGen.sort((a, b) => a[1].lastAccess - b[1].lastAccess) // Sort by last access time (oldest first)
+          .slice(0, newGen.length - Math.floor(maxNodeStats * 0.7)) // Keep the most recent 70%
+          .forEach(([k]) => this._removeNodeFromStats(k));
+    }
+
+
+    // 清理老生代 (LRU, 清理超出30%限额的部分)
+    if (oldGen.length > maxNodeStats * 0.3) {
+        oldGen.sort((a, b) => a[1].lastAccess - b[1].lastAccess)
+          .slice(0, oldGen.length - Math.floor(maxNodeStats * 0.3)) // Keep the most recent 30%
+          .forEach(([k]) => this._removeNodeFromStats(k));
+    }
+
+    // 分代升级/降级机制
+    this.nodeStats.forEach((stats, key) => {
+        if (stats.accessCount > 3 && !oldGen.find(entry => entry[0] === key)) {
+            // Potential promotion if it was missed (e.g. due to concurrent modification)
+            // Or simply ensure lastPromoted is set for oldGen items
+            if (oldGen.find(entry => entry[0] === key)) stats.lastPromoted = now;
+        } else if (stats.accessCount <= 3 && oldGen.find(entry => entry[0] === key)) {
+            // Demotion: if an oldGen node's access count drops
+            stats.lastPromoted = 0; // Reset promotion time, effectively moving to newGen logic
+        }
+    });
   }
 
   _updateAllMetrics(url, metrics) {
-    this.metricsRegistry.get('jitter').add(metrics.jitter);
-    // 增加内存清理机制
-    // 增强内存回收机制
-// 内存回收策略优化（LRU+TTL）
-const memoryManager = {
-  cleanup: () => {
-    const now = Date.now();
-    const lruList = Array.from(this.nodeStats.entries())
-      .sort((a, b) => (a[1].lastAccess || 0) - (b[1].lastAccess || 0))
-      .slice(AppState.THRESHOLDS.MAX_NODE_STATS);
+    // 确保 jitter 指标收集器存在并添加数据
+    const jitterCollector = this.metricsRegistry.get('jitter');
+    if (jitterCollector && metrics.jitter !== undefined && isFinite(metrics.jitter)) {
+        jitterCollector.add(metrics.jitter);
+    }
 
-    lruList.forEach(([k]) => {
-      clearInterval(this.nodeStats.get(k)?.reviewTimer);
-      clearTimeout(this.nodeStats.get(k)?.quarantineTimer);
-      this.nodeStats.delete(k);
-      this.failureCounts.delete(k);
+    // 执行内存管理
+    this._manageMemory();
+
+    // 更新nodeStats，存储实时指标
+    const currentNodeStats = this.nodeStats.get(url) || {};
+    this.nodeStats.set(url, {
+      ...currentNodeStats,
+      latency: metrics.latency,
+      packetLoss: metrics.packetLoss,
+      jitter: metrics.jitter,
+      // 考虑节点独立成功率或使用全局成功率
+      successRate: (this.metricsRegistry.get('successRate') ? this.metricsRegistry.get('successRate').rate : 1),
+      lastAccess: Date.now(),
+      lastUpdate: Date.now(),
+      // 初始化 accessCount 如果它还不存在
+      accessCount: (currentNodeStats.accessCount || 0)
     });
-  }
-};
-memoryManager.cleanup();
-    
+
+    // 更新其他指标收集器
     for (const [type, collector] of this.metricsRegistry) {
-      collector.add(type === 'successRate' ? 1 : metrics[type]);
+      if (type === 'jitter') continue; // Jitter already handled
+      // Ensure metric value is valid before adding
+      const metricValue = metrics[type];
+      if (type === 'successRate') {
+        collector.add(1); // Assuming a successful probe means success for this specific check
+      } else if (metricValue !== undefined && isFinite(metricValue)) {
+        collector.add(metricValue);
+      }
     }
   }
-}
 
-class CDN_CONFIG {
-  constructor() {
-    this.jsdelivr = 'https://cdn.jsdelivr.net/gh/';
-    this.fallback = 'https://fallback.example.com/';
-    this.manager = CentralManager.instance;
-    this.nodeStats = new Map();
-    this.quarantinedNodes = new Set();
-    this.trafficPatterns = new Map();
-    this.historyWindow = 24 * 60 * 60 * 1000;
-    this.sources = [
-      'https://cdn.jsdelivr.net/gh/',
-      'https://fastly.jsdelivr.net/gh/',
-      'https://testingcf.jsdelivr.net/gh/'
-    ];
-    this.currentIndex = 0;
-    this.metrics = {
-      failureCount: new Map(),
-      latencyStats: new Map(),
-      packetLossStats: new Map(),
-      historyStats: new Map()
-    };
-    // 阈值管理已迁移至AppState.THRESHOLDS
-    this.stabilityWeights = Object.freeze({
-      latency: 0.6,
-      packetLoss: 0.3,
-      successRate: 0.1,
-      BURST_TOLERANCE: 0.2,
-      SCORE_IMPROVEMENT_RATIO: 0.8
-    });
-    this.cooldown = new Map(); // 新增CDN冷却机制
+  getCurrentCDN() {
+    return this.cdnPool[this.activeIndex];
   }
 
-  getCurrent() {
-    return this.sources[this.currentIndex];
-  }
-
-  async healthCheck(url) {
-    return this.manager.performHealthCheck(url);
-  }
-
-
-
-
-
-
-
-  // 动态阈值使用中央管理器版本
-  _getDynamicThresholds() {
-    return CentralManager.instance.dynamicThresholds;
-  }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-  _updateDynamicWeights() {
-    // 权重计算已由CentralManager统一处理
-    return CentralManager.instance.calculateDynamicWeights();
-  }
-
-  _getTrafficFactor(type) {
-    const patterns = Array.from(this.trafficPatterns.values());
-    return patterns.reduce((sum, p) => sum + p[type + 'Weight'], 0) / (patterns.length || 1);
-  }
-
-  switchSource() {
+  /**
+   * 切换CDN源。
+   * 首先检查当前CDN的质量评分，如果低于阈值则强制切换。
+   * 然后检查切换冷却时间，避免过于频繁的切换。
+   * 最后，在所有未被隔离的CDN中选择稳定性评分最高的进行切换（如果优于当前源10%或当前源评分低于0.7）。
+   */
+  switchCDNSource() {
     // 严格遵循qualityScore阈值
-    const currentScore = this._calculateStabilityScore(this.getCurrent());
-    if (currentScore < AppState.nodes.thresholds.get('minQualityScore') ?? 0.65) {
-      this.forceSwitch();
+    const currentCDN = this.getCurrentCDN();
+    const currentScore = this._calculateStabilityScore(currentCDN);
+    const minQualityScore = AppState.nodes.thresholds.get('minQualityScore') ?? 0.65;
+
+    if (currentScore < minQualityScore) {
+      this.activeIndex = (this.activeIndex + 1) % this.cdnPool.length;
+      AppState.nodeSwitchCooldown.set(this.activeIndex, Date.now());
       return;
     }
-    // 动态权重调整（根据实时流量模式）
-    this._updateDynamicWeights();
-    const performanceData = this.predictNodePerformance(this.getCurrent());
-    this.stabilityWeights.latency *= 0.8;  // 增加权重平滑因子
-    this.stabilityWeights.packetLoss *= 0.8;
 
     // 新增冷却时间检查（30分钟内不重复切换）
-    if(AppState.nodeSwitchCooldown.has(this.currentIndex) && 
-      Date.now() - AppState.nodeSwitchCooldown.get(this.currentIndex) < 1800000) {
+    if (AppState.nodeSwitchCooldown.has(this.activeIndex) &&
+      Date.now() - AppState.nodeSwitchCooldown.get(this.activeIndex) < 1800000) {
       return;
     }
 
-    // 多维度评分算法
-    const scores = this.sources.map(url => {
-      const stats = this.latencyStats.get(url);
-      if (!stats) return Infinity;
+    let bestScore = -Infinity;
+    let bestIndex = this.activeIndex;
 
-      // 实时流量特征分析
-      const trafficPattern = this._analyzeTrafficPattern(url);
+    for (let i = 0; i < this.cdnPool.length; i++) {
+      const url = this.cdnPool[i];
+      if (this.quarantinedNodes.has(url)) {
+        continue;
+      }
+      const score = this._calculateStabilityScore(url);
       
-      // 多维评分要素
-      const successRate = this.historyStats.get(url)?.successRate || 0;
-      const { latencyFactor, lossImpact, successImpact } = this._getPredictionFactors(url);
-    const stabilityScore = 
-        (stats.avgLatency * this.stabilityWeights.latency) * trafficPattern.latencyWeight * latencyFactor +
-        (stats.packetLoss * 1000 * this.stabilityWeights.packetLoss) * trafficPattern.lossWeight * lossImpact +
-        ((1 - successRate) * 1000 * this.stabilityWeights.successRate) * trafficPattern.successWeight * successImpact;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+    }
 
-      // 新增突发流量容忍系数
-      return stabilityScore * (1 + Math.min(trafficPattern.burstTolerance, 0.2));
-    });
-
-    const bestScore = Math.min(...scores);
-    const bestIndex = scores.indexOf(bestScore);
-
-    // 当新评分优于当前20%以上才切换
-    if (bestScore < scores[this.currentIndex] * 0.6) {  // 提高切换阈值
-      this.currentIndex = bestIndex;
+    const currentSourceScore = this._calculateStabilityScore(currentCDN);
+    if (bestIndex !== this.activeIndex && (bestScore > currentSourceScore * 1.1 || currentSourceScore < 0.7)) {
+      this.activeIndex = bestIndex;
       AppState.nodeSwitchCooldown.set(bestIndex, Date.now());
     }
   }
 }
+// CDN_CONFIG class has been removed and its functionality integrated into CentralManager
 
-// ========== 优质/劣质节点状态与评估周期管理 ========== 
-// 节点评估策略已整合至CentralManager统一管理
-
-const getEvalInterval = (node) => {
-  const score = nodeEvaluation.score.get(node) || 0;
-  return Math.min(nodeEvaluation.BASE_INTERVAL * (2 ** Math.abs(score)), nodeEvaluation.MAX_INTERVAL);
-};
-
-
-
-async function selectBestNodeWithQuality(nodes) {
-  await periodicEvaluateAllNodes(nodes);
-  const results = await Promise.all(nodes.map(async n => {
-    const metrics = await testNodeMultiMetrics(n);
-    const history = nodeHistoryCache.get(n) ?? 1;
-    const aiScore = aiScoreNode({ ...metrics, history });
-    const weight = getNodePriorityWeight(n);
-    return { node: n, aiScore, weight, status: nodeQualityStatus.get(n) };
-  }));
-  results.sort((a, b) => (b.weight - a.weight) || (a.aiScore - b.aiScore));
-  return results[0].node;
-}
-
-// ========== 节点切换逻辑增强 ========== 
-async function autoSwitchNode(currentNode, nodes, mode = 'smart') {
-  const now = Date.now();
-  const { status, score, nextEval, BASE_INTERVAL, MAX_INTERVAL, THRESHOLD } = nodeEvaluation;
-
-  if (mode === 'basic') {
-    if (status.get(currentNode) && now - status.get(currentNode) < 60000) return currentNode;
-    const best = await selectBestNodeWithQuality(nodes);
-    if (best !== currentNode) {
-      status.set(best, now);
-    }
-    return best;
-  }
-
-  // 智能模式
-  const cooldown = getSwitchCooldown(currentNode);
-  if (status.get(currentNode) && now < status.get(currentNode) + cooldown) return currentNode;
-
-  await periodicEvaluateAllNodes(nodes);
-  const best = await selectBestNodeWithQuality(nodes);
-
-  if (best !== currentNode) {
-    status.set(best, now + getSwitchCooldown(best));
-    return best;
-  }
-
-  status.set(currentNode, now + cooldown);
-  return currentNode;
-}
-
-function getSwitchCooldown(node) {
-  const score = score.get(node) || 0;
-  return Math.min(BASE_INTERVAL * Math.pow(2, Math.max(0, score - 1)), MAX_INTERVAL);
-}
-
-// 智能分流调度核心
-// 支持节点健康检查、测速缓存、优选、负载均衡、异常降级
-const nodeHealthCache = new Map();
-const nodeSpeedCache = new Map();
-const nodeErrorCount = new Map();
-const nodeLastCheck = new Map();
-const SPEED_TEST_INTERVAL = 300000; // 5分钟测速一次
-const HEALTHY_THRESHOLD = 2; // 连续2次异常视为不健康
-const RETRY_DELAY = 10000; // 10秒后重试异常节点
-
-// 已被 testNodeMultiMetrics 替代，保留兼容
-
-
-// 健康检查已由CentralManager统一处理
-
-const BASE_INTERVAL = 30000; // 统一基准间隔常量
-
-// 已被多维度 selectBestNode 替代
 
 
 class LRUCache {
@@ -1007,10 +1220,10 @@ ruleProviders.set('applications', {
   ...ruleProviderCommon,
   behavior: 'classical',
   format: 'text',
-  url: `${CDN_CONFIG.jsdelivr}DustinWin/ruleset_geodata@clash-ruleset/applications.list`,
+  url: `${CentralManager.instance.cdnPool[0]}DustinWin/ruleset_geodata@clash-ruleset/applications.list`,
   path: './ruleset/DustinWin/applications.list',
   'fallback-url': [
-    `${CDN_CONFIG.fallback}DustinWin/ruleset_geodata/clash-ruleset/applications.list`
+    `${CentralManager.instance.cdnPool[1]}DustinWin/ruleset_geodata/clash-ruleset/applications.list`
   ]
 })
 
@@ -2297,6 +2510,7 @@ class NodeManager {
     this._updateNodeUsageStats(node);
   }
   constructor() {
+    this.currentPremiumNode = null; // 当前优质节点标记
     this.currentNode = null;
     this.nodeSwitchCooldown = new Map();
     this.BASE_SWITCH_COOLDOWN = 30 * 60 * 1000;
