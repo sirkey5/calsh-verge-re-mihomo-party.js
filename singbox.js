@@ -9,7 +9,8 @@ class AppState {
     BASE_QUARANTINE_DURATION: 24 * 60 * 60 * 1000,
     
     NODE_EXPIRE_TIME: 30 * 24 * 60 * 60 * 1000,
-    NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000
+    NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000,
+    QUARANTINE_EXIT_SCORE: 0.7 // Added: Score threshold to exit quarantine
   });
 
   static nodes = Object.freeze({
@@ -101,17 +102,56 @@ class CentralManager {
   static instance = new this();
   constructor() {
     this.manager = CentralManager.instance;
-    // Placeholder for Prober, replace with actual implementation
+    this.currentPremiumNode = null; // Explicitly initialize current premium node
+    this.connectionPool = { // Mock connection pool
+      hasIdleConnections: () => false, // Placeholder
+      releaseFailedConnection: (url) => console.log(`[ConnectionPool] Released connection for ${url} (mock)`) // Placeholder
+    };
+    // Actual Prober implementation
     this.prober = {
-      probeTCP: async (url) => ({ avgLatency: 200, packetLossRate: 0, jitter: 10 }),
-      probeUDP: async (url) => ({ avgLatency: 200, packetLossRate: 0, jitter: 10 }),
-      checkHttpStatus: async (url) => ({ statusCode: 200 })
+      probeTCP: async (url) => {
+        // Actual TCP probing is complex and environment-dependent.
+        // This might require native modules or external tools.
+        // Placeholder returning a mock success for now.
+        console.log(`[Prober.probeTCP] Mock TCP probe for ${url}`);
+        return { avgLatency: Math.random() * 100 + 50, packetLossRate: Math.random() * 0.05, jitter: Math.random() * 20 };
+      },
+      probeUDP: async (url) => {
+        // Actual UDP probing is also complex and environment-dependent.
+        // Placeholder returning a mock success for now.
+        console.log(`[Prober.probeUDP] Mock UDP probe for ${url}`);
+        return { avgLatency: Math.random() * 120 + 60, packetLossRate: Math.random() * 0.07, jitter: Math.random() * 25 };
+      },
+      checkHttpStatus: async (url) => {
+        console.log(`[Prober.checkHttpStatus] HTTP probe for ${url}`);
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 seconds timeout
+          const response = await fetch(url, { method: 'HEAD', signal: controller.signal, mode: 'no-cors' }); // 'no-cors' for basic check, status might be 0
+          clearTimeout(timeoutId);
+          // For 'no-cors' requests, we can't directly access status for cross-origin, 
+          // but a successful fetch (no error) indicates reachability.
+          // If a more precise status is needed, CORS headers must be set on the server.
+          // Or, if running in a Node.js environment with a library like 'node-fetch', full response is available.
+          // Assuming success if no error is thrown for 'no-cors' in browser-like env.
+          return { statusCode: response.ok ? 200 : (response.status || 503) }; // response.status might be 0 for opaque 'no-cors' responses
+        } catch (error) {
+          console.error(`[Prober.checkHttpStatus] Error probing ${url}: ${error.message}`);
+          return { statusCode: 503 }; // Service Unavailable or other error
+        }
+      }
     };
     this.metricsRegistry = new Map([
       ['latency', new RollingStats()],
       ['packetLoss', new RollingStats()],
+      ['jitter', new RollingStats()], // Added: Jitter tracking
       ['successRate', new SuccessRateTracker()]
     ]);
+    this.trafficPatterns = new Map([
+      ['latency', []],
+      ['loss', []],
+      ['success', []] // For success rate patterns
+    ]); // Initialize trafficPatterns
     this.cdnPool = [
       'https://cdn.jsdelivr.net/gh/',
       'https://fastly.jsdelivr.net/gh/',
@@ -135,44 +175,56 @@ class CentralManager {
   }
 
   _getTrafficFactor(metricType) {
-    // Placeholder implementation for traffic factor calculation
-    // This should be replaced with actual logic based on traffic patter    const trafficData = this.trafficPatterns.get(metricType) || [];
-    // 增加成功率趋势分析
-const successPatterns = this.trafficPatterns.get('success') || [];
-const successTrend = successPatterns.length > 3 
-  ? successPatterns.slice(-3).reduce((a,b) => a + (b > 0.8 ? 1 : -1), 0)
-  : 0;
+    // This method calculates a dynamic weighting factor for a given metric type.
+    // It considers recent trends in the metric's data and success patterns,
+    // and applies a time-based decay to the factor.
 
-if (trafficData.length < 5) {
-  return successTrend > 0 ? 0.28 : 0.38; // 根据成功趋势调整默认权重
-}
+    const trafficData = this.trafficPatterns.get(metricType) || [];
+    
+    let calculatedFactor;
 
-    // Simulate a more concrete logic: analyze the trend of the last 5 data points
-    const recentData = trafficData.slice(-5);
-    const averageRecent = recentData.reduce((a, b) => a + b, 0) / recentData.length;
-    const averageOverall = trafficData.reduce((a, b) => a + b, 0) / trafficData.length;
+    if (trafficData.length < 5) {
+      const successPatterns = this.trafficPatterns.get('success') || [];
+      const successTrend = successPatterns.length > 3
+        ? successPatterns.slice(-3).reduce((a, b) => a + (b > 0.8 ? 1 : -1), 0)
+        : 0;
+      calculatedFactor = successTrend > 0 ? 0.28 : 0.38; // Default weight based on success trend
+    } else {
+      // trafficData.length >= 5
+      const recentData = trafficData.slice(-5); // Exactly 5 elements
+      const averageRecent = recentData.reduce((a, b) => a + b, 0) / recentData.length; // length is 5
+      const averageOverall = trafficData.reduce((a, b) => a + b, 0) / trafficData.length; // length >= 5
 
-    let factor = 0.33; // Base factor
+      calculatedFactor = 0.33; // Base factor
 
-    // If recent average is significantly higher than overall, increase weight for that metric
-    if (averageRecent > averageOverall * 1.2) {
-      factor = 0.45;
-    } else if (averageRecent < averageOverall * 0.8) {
-      factor = 0.20;
+      if (averageOverall > 0) {
+        if (averageRecent > averageOverall * 1.2) {
+          calculatedFactor = 0.45; // Higher weight if recent performance is much better
+        } else if (averageRecent < averageOverall * 0.8) {
+          calculatedFactor = 0.20; // Lower weight if recent performance is much worse
+        }
+      } else if (averageRecent > 0) { // Overall is 0, recent is positive (strong upward trend)
+        calculatedFactor = 0.45;
+      }
+      // If both averageOverall and averageRecent are 0 (or overall is 0, recent is 0), factor remains 0.33
     }
 
-    // Specific adjustments based on metric type
-    if (metricType === 'latency') {
-      // If latency is trending up, prioritize it more
-      return trafficData[trafficData.length -1] > trafficData[trafficData.length -2] ? Math.min(0.5, factor + 0.1) : Math.max(0.2, factor - 0.05);
+    // Specific adjustments based on metric type, only if enough data for trend comparison
+    if (trafficData.length >= 2) {
+      const lastValue = trafficData[trafficData.length - 1];
+      const secondLastValue = trafficData[trafficData.length - 2];
+      if (metricType === 'latency') {
+        calculatedFactor = lastValue > secondLastValue ? Math.min(0.5, calculatedFactor + 0.1) : Math.max(0.2, calculatedFactor - 0.05);
+      } else if (metricType === 'loss') {
+        calculatedFactor = lastValue > secondLastValue ? Math.min(0.5, calculatedFactor + 0.15) : Math.max(0.15, calculatedFactor - 0.05);
+      }
     }
-    if (metricType === 'loss') {
-      // If packet loss is trending up, prioritize it more
-      return trafficData[trafficData.length -1] > trafficData[trafficData.length -2] ? Math.min(0.5, factor + 0.15) : Math.max(0.15, factor - 0.05);
-    }
-    // 增加网络质量衰减系数
-const qualityDecay = Math.exp(-Date.now()/this.historyWindow);
-return Math.max(0.1, Math.min(0.6, factor * (0.9 + qualityDecay*0.2)));
+
+    // Apply network quality decay factor
+    const historyWindowMs = this.historyWindow || (24 * 60 * 60 * 1000); // Default from constructor
+    const qualityDecay = Math.exp(-Date.now() / historyWindowMs);
+    
+    return Math.max(0.1, Math.min(0.6, calculatedFactor * (0.9 + qualityDecay * 0.2)));
   }
 
   /**
@@ -198,7 +250,7 @@ const baseTimeout = Math.min(3000, Math.max(800,
 ));
 
       // RTT值和统计计算，用于后续的动态超时调整和EMA滤波
-      const rttValues = (this.metricsRegistry.get('latency') && this.metricsRegistry.get('latency').values) || [];
+      const rttValues = (this.metricsRegistry.get('latency') && this.metricsRegistry.get('latency').fullWindow) || []; // Changed .values to .fullWindow
       const meanRTT = rttValues.length > 0 ? rttValues.reduce((a, b) => a + b, 0) / rttValues.length : avgLatency;
       const rttStdDevCalc = rttValues.length > 1 ? Math.sqrt(rttValues.reduce((a, x) => a + Math.pow(x - meanRTT, 2), 0) / rttValues.length) : 0;
       // const volatilityFactor = 1 + (rttStdDevCalc / (meanRTT || 1)); // meanRTT can't be 0 if rttValues exist
@@ -245,29 +297,33 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
   }
 
   // 统一健康检查
+
+  _handleUnhealthyOrError(url, failures) {
+    // 实时网络质量评估
+    const latencyMetrics = this.metricsRegistry.get('latency');
+    const currentLatencyValues = (latencyMetrics && Array.isArray(latencyMetrics.fullWindow) && latencyMetrics.fullWindow.slice(-3)) || [];
+    
+    const networkScore = currentLatencyValues.length > 0
+      ? currentLatencyValues.reduce((a, b) => a + b, 0) / currentLatencyValues.length
+      : Infinity;
+
+    const networkScoreThreshold = 800; 
+    return networkScore < networkScoreThreshold ? this._rotateCDN(url) : this._handleFailure(url, failures);
+  }
+
   async performHealthCheck(url) {
     const failures = this.failureCounts.get(url) || 0;
     try {
       const metrics = await this.probeEndpoint(url);
       if (this._isUnhealthy(metrics)) {
-        // 实时网络质量评估
-const currentMetrics = this.metricsRegistry.get('latency').values.slice(-3);
-const networkScore = currentMetrics.length > 0 
-  ? currentMetrics.reduce((a, b) => a + b, 0) / currentMetrics.length 
-  : Infinity;
-
-return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, failures);
+        console.warn(`[CentralManager.performHealthCheck] Node ${url} is unhealthy. Metrics:`, JSON.stringify(metrics));
+        return this._handleUnhealthyOrError(url, failures);
       }
       this._updateAllMetrics(url, metrics);
       return true;
     } catch (e) {
-      // 实时网络质量评估
-const currentMetrics = this.metricsRegistry.get('latency').values.slice(-3);
-const networkScore = currentMetrics.length > 0 
-  ? currentMetrics.reduce((a, b) => a + b, 0) / currentMetrics.length 
-  : Infinity;
-
-return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, failures);
+      console.error(`[CentralManager.performHealthCheck] Error during health check for ${url}: ${e.message}. Stack: ${e.stack}`);
+      return this._handleUnhealthyOrError(url, failures);
     }
   }
 
@@ -282,19 +338,22 @@ return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, fail
     };
   }
 
-  _normalizeMetrics(tcp, udp) {
+  _normalizeMetrics(tcp, udp, http) { // Added http parameter
     return {
       latency: tcp.avgLatency,
       packetLoss: tcp.packetLossRate,
       jitter: udp.jitter,
+      httpStatusCode: http ? http.statusCode : null, // Utilize httpResult
       timestamp: Date.now()
     };
   }
 
   _isUnhealthy(metrics) {
     const thresholds = this.dynamicThresholds;
+    const isHttpError = metrics.httpStatusCode !== null && (metrics.httpStatusCode < 200 || metrics.httpStatusCode >= 400);
     return metrics.latency > thresholds.latency || 
-           metrics.packetLoss > thresholds.packetLoss;
+           metrics.packetLoss > thresholds.packetLoss ||
+           isHttpError; // Added HTTP status check
   }
 
   /**
@@ -341,6 +400,138 @@ return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, fail
     return Math.min(1.2, 1 + (currentJitter / 50));
   }
 
+  _getJitterStdDev() {
+    const jitterStats = this.metricsRegistry.get('jitter');
+    // Ensure there are enough data points to calculate standard deviation meaningfully
+    if (jitterStats && jitterStats.fullWindow && jitterStats.fullWindow.length > 1) {
+      const values = jitterStats.fullWindow;
+      const mean = values.reduce((a, b) => a + b, 0) / values.length;
+      // Corrected variance calculation (sum of squared differences from mean)
+      const variance = values.reduce((sumSqDiff, val) => sumSqDiff + Math.pow(val - mean, 2), 0) / values.length;
+      if (variance < 0) return 5; // Should not happen with Math.pow, but as a safeguard
+      return Math.sqrt(variance);
+    }
+    // Return a default or indicative value if insufficient data
+    return 10; // Default jitter standard deviation (e.g., 10ms)
+  }
+
+  _updateAllMetrics(url, metrics) {
+    console.log(`[CentralManager._updateAllMetrics] Updating metrics for ${url}:`, metrics);
+    const nodeStat = this.nodeStats.get(url) || {};
+    nodeStat.latency = metrics.latency;
+    nodeStat.packetLoss = metrics.packetLoss;
+    nodeStat.jitter = metrics.jitter;
+    nodeStat.httpStatusCode = metrics.httpStatusCode;
+    nodeStat.lastUpdateTime = metrics.timestamp;
+    const isCurrentlyHealthy = !this._isUnhealthy(metrics);
+    // Simplified success rate update: (previous rate * decay) + (current_status * weight)
+    // Ensure nodeStat.successRate is initialized if it's undefined
+    const previousSuccessRate = typeof nodeStat.successRate === 'number' ? nodeStat.successRate : 0.9; // Default to 0.9 if undefined
+    nodeStat.successRate = previousSuccessRate * 0.9 + (isCurrentlyHealthy ? 0.1 : 0);
+    this.nodeStats.set(url, nodeStat);
+
+    if (metrics.latency !== Infinity && typeof metrics.latency === 'number') this.metricsRegistry.get('latency').add(metrics.latency);
+    if (metrics.packetLoss !== 1 && typeof metrics.packetLoss === 'number') this.metricsRegistry.get('packetLoss').add(metrics.packetLoss);
+    if (metrics.jitter !== Infinity && typeof metrics.jitter === 'number') this.metricsRegistry.get('jitter').add(metrics.jitter);
+    this.metricsRegistry.get('successRate').add(isCurrentlyHealthy);
+
+    this.failureCounts.set(url, 0); // Reset failure count on successful update
+
+    // Update traffic patterns
+    if (metrics.latency !== Infinity && typeof metrics.latency === 'number') {
+      const latencyPattern = this.trafficPatterns.get('latency') || [];
+      latencyPattern.push(metrics.latency);
+      if (latencyPattern.length > 100) latencyPattern.shift(); // Keep last 100 entries
+      this.trafficPatterns.set('latency', latencyPattern);
+    }
+    if (metrics.packetLoss !== 1 && typeof metrics.packetLoss === 'number') {
+      const lossPattern = this.trafficPatterns.get('loss') || [];
+      lossPattern.push(metrics.packetLoss);
+      if (lossPattern.length > 100) lossPattern.shift(); // Keep last 100 entries
+      this.trafficPatterns.set('loss', lossPattern);
+    }
+    const successPattern = this.trafficPatterns.get('success') || [];
+    successPattern.push(isCurrentlyHealthy ? 1 : 0); // 1 for success, 0 for failure
+    if (successPattern.length > 100) successPattern.shift(); // Keep last 100 entries
+    this.trafficPatterns.set('success', successPattern);
+    // Note: For persistent storage or more advanced analytics of trafficPatterns,
+    // consider integrating with a database or a more robust data logging mechanism.
+  }
+
+  _handleFailure(url, failuresArgument /* Renamed to avoid conflict with this.failureCounts */) {
+    console.log(`[CentralManager._handleFailure] Handling failure for ${url}, current failures from argument: ${failuresArgument}`);
+    const newFailures = (this.failureCounts.get(url) || 0) + 1;
+    this.failureCounts.set(url, newFailures);
+    console.log(`[CentralManager._handleFailure] Updated failure count for ${url} to ${newFailures}`);
+
+    const quarantineThreshold = 5; // Default, consider adding to AppState.THRESHOLDS
+    if (newFailures > quarantineThreshold) {
+      console.warn(`[CentralManager._handleFailure] Node ${url} has failed ${newFailures} times. Quarantining.`);
+      this.quarantinedNodes.add(url);
+      this._scheduleNodeReview(url);
+    }
+    
+    if (this.connectionPool && typeof this.connectionPool.releaseFailedConnection === 'function') {
+        this.connectionPool.releaseFailedConnection(url);
+    }
+    
+    this.metricsRegistry.get('successRate').add(false);
+
+    return false; // Indicate health check failed
+  }
+
+  _rotateCDN(url) {
+    console.log(`[CDN Rotation] Attempting to rotate CDN due to issues with ${url}. Current active index: ${this.activeIndex}`);
+    const oldActiveCDN = this.cdnPool[this.activeIndex];
+    this.activeIndex = (this.activeIndex + 1) % this.cdnPool.length;
+    const newActiveCDN = this.cdnPool[this.activeIndex];
+    console.log(`[CDN Rotation] Rotated from ${oldActiveCDN} to ${newActiveCDN}.`);
+
+    // Reset failure count for the URL that triggered rotation, as we are moving away from it.
+    this.failureCounts.set(url, 0);
+    
+    // It might also be prudent to set a cooldown for the newly activated CDN to prevent immediate re-evaluation or flapping.
+    // Example: AppState.nodes.switchCooldown.set(newActiveCDN, Date.now() + 60000); // 1 minute cooldown
+
+    return true; // Indicate rotation occurred
+  }
+
+  _isNodeFaulty(url) {
+    const stats = this.nodeStats.get(url);
+    if (!stats) {
+        console.log(`[Node Faulty Check] No stats for ${url}, considering faulty.`);
+        return true; // If no stats, consider it faulty or unknown
+    }
+
+    const thresholds = this.dynamicThresholds; // Assuming this.dynamicThresholds is available and provides { latency, packetLoss }
+    
+    // Check current metrics against dynamic thresholds
+    // A node might be considered faulty if its current performance is significantly worse than acceptable levels.
+    const isMetricsBad = (stats.latency !== undefined && stats.latency > thresholds.latency * 1.5) || // e.g., 50% worse than threshold
+                         (stats.packetLoss !== undefined && stats.packetLoss > thresholds.packetLoss * 1.5);
+    
+    // Note: Calling _calculateStabilityScore here might lead to recursion if _isNodeFaulty is called from _handleFailure,
+    // which itself calls _calculateStabilityScore. This needs careful handling.
+
+    if (isMetricsBad) {
+        console.log(`[Node Faulty Check] Node ${url} considered faulty due to bad metrics. Latency: ${stats.latency}, Packet Loss: ${stats.packetLoss}`);
+        return true;
+    }
+    // console.log(`[Node Faulty Check] Node ${url} considered NOT faulty.`);
+    return false;
+  }
+
+  _scheduleNodeReview(url) {
+    console.log(`[Node Review] Node ${url} has been scheduled for review following quarantine.`);
+    const nodeStat = this.nodeStats.get(url) || {};
+    nodeStat.needsReview = true;
+    nodeStat.reviewScheduledAt = Date.now();
+    // Example: Set a flag for manual intervention or a very long automated re-evaluation period.
+    // nodeStat.nextAutomatedReviewTime = Date.now() + (AppState.THRESHOLDS.NODE_EXPIRE_TIME || 30 * 24 * 60 * 60 * 1000);
+    this.nodeStats.set(url, nodeStat);
+    console.log(`[Node Review] ${url} marked for review. Stats updated:`, nodeStat);
+  }
+
   _calculateStabilityScore(url) {
     const stats = this.nodeStats.get(url) || { successRate: 0.9, latency: 300, packetLoss: 0, jitter: 0, historicalSuccess: [], continuousStableDays: 0, lastAccessTime: Date.now() };
 
@@ -361,14 +552,28 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     const isPremiumCandidate = (successRateComponent > 0.85 && latencyComponent > 0.8 && packetLossComponent > 0.9) || 
       (successRateComponent + latencyComponent + packetLossComponent > 2.4);
     
-    if (isPremiumCandidate && !this.currentPremiumNode) {
-      this.currentPremiumNode = {
-        url,
-        score: successRateComponent + latencyComponent + packetLossComponent,
-        timestamp: Date.now(),
-        stability: networkQualityFactor
-      };
-      console.log(`[优质节点标记] ${url} 综合评分${this.currentPremiumNode.score.toFixed(2)}`);
+    if (isPremiumCandidate) {
+      const newScore = successRateComponent + latencyComponent + packetLossComponent;
+      // Update if no current premium node or if the new node has a better score
+      if (!this.currentPremiumNode || newScore > this.currentPremiumNode.score) {
+        this.currentPremiumNode = {
+          url,
+          score: newScore,
+          timestamp: Date.now(),
+          stability: networkQualityFactor // networkQualityFactor was already calculated
+        };
+        console.log(`[优质节点标记更新] ${url} 被标记为新的优质节点，综合评分 ${this.currentPremiumNode.score.toFixed(2)}`);
+      } else if (this.currentPremiumNode && url === this.currentPremiumNode.url) {
+        // If the current premium node is being re-evaluated and is still a premium candidate, update its score
+        this.currentPremiumNode.score = newScore;
+        this.currentPremiumNode.timestamp = Date.now();
+        this.currentPremiumNode.stability = networkQualityFactor;
+        // console.log(`[优质节点刷新] ${url} 优质节点状态刷新，综合评分 ${this.currentPremiumNode.score.toFixed(2)}`); // Optional: uncomment for more verbose logging
+      }
+    } else if (this.currentPremiumNode && this.currentPremiumNode.url === url) {
+      // If the current premium node is no longer a premium candidate (e.g., its score dropped), clear it.
+      console.log(`[优质节点移除] ${url} (原优质节点) 不再符合优质节点条件，已被移除。`);
+      this.currentPremiumNode = null;
     }
 
     return Math.min(0.95,
@@ -385,10 +590,66 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
    * @returns {string} 最优节点的URL。
    */
   getBestNode() {
-    // Placeholder implementation for getting the best node
-    // This should be replaced with actual logic based on node stats and scores
-    // For now, return the currently active CDN URL
-    return this.cdnPool[this.activeIndex];
+    if (!this.cdnPool || this.cdnPool.length === 0) {
+      console.error("[CentralManager.getBestNode] CDN pool is empty!");
+      return null;
+    }
+
+    let bestNode = null;
+    let highestScore = -Infinity;
+
+    // Consider the current premium node first if it's healthy
+    if (this.currentPremiumNode && !this.quarantinedNodes.has(this.currentPremiumNode.url)) {
+        const premiumScore = this._calculateStabilityScore(this.currentPremiumNode.url);
+        // Add a bias for the premium node if its score is still good
+        if (premiumScore > (AppState.THRESHOLDS.QUARANTINE || 0.5) * 1.2) { // e.g., 20% above quarantine threshold
+            // console.log(`[CentralManager.getBestNode] Prioritizing premium node ${this.currentPremiumNode.url} with score ${premiumScore.toFixed(3)}`);
+            return this.currentPremiumNode.url;
+        }
+    }
+    
+    // Iterate through all available (non-quarantined) nodes in the cdnPool
+    for (const nodeUrl of this.cdnPool) {
+      if (this.quarantinedNodes.has(nodeUrl)) {
+        // console.log(`[CentralManager.getBestNode] Skipping quarantined node ${nodeUrl}`);
+        continue;
+      }
+
+      // Check if node is on cooldown for switching
+      const cooldownEndTime = AppState.nodes.switchCooldown.get(nodeUrl);
+      if (cooldownEndTime && Date.now() < cooldownEndTime) {
+        // console.log(`[CentralManager.getBestNode] Node ${nodeUrl} is on switch cooldown. Skipping.`);
+        continue;
+      }
+
+      const score = this._calculateStabilityScore(nodeUrl);
+      // console.log(`[CentralManager.getBestNode] Node ${nodeUrl} score: ${score.toFixed(3)}`);
+
+      if (score > highestScore) {
+        highestScore = score;
+        bestNode = nodeUrl;
+      }
+    }
+
+    if (bestNode) {
+      // console.log(`[CentralManager.getBestNode] Selected best node: ${bestNode} with score ${highestScore.toFixed(3)}`);
+      // Update activeIndex if the best node is different from the current active one
+      const bestNodeIndex = this.cdnPool.indexOf(bestNode);
+      if (bestNodeIndex !== -1 && bestNodeIndex !== this.activeIndex) {
+          // console.log(`[CentralManager.getBestNode] Updating activeIndex from ${this.activeIndex} to ${bestNodeIndex}`);
+          this.activeIndex = bestNodeIndex;
+      }
+      return bestNode;
+    }
+
+    // Fallback: if all nodes are problematic or scores are equal, return current active or first non-quarantined
+    // console.warn("[CentralManager.getBestNode] No clearly best node found, returning current active or first available.");
+    const fallbackNode = this.cdnPool.find(url => !this.quarantinedNodes.has(url)) || this.cdnPool[this.activeIndex] || this.cdnPool[0];
+    if (fallbackNode) {
+        const fallbackIndex = this.cdnPool.indexOf(fallbackNode);
+        if (fallbackIndex !== -1 && fallbackIndex !== this.activeIndex) this.activeIndex = fallbackIndex;
+    }
+    return fallbackNode || null;
   }
 
   /**
@@ -2180,8 +2441,9 @@ async function autoUpdateCurrentNode(allNodes) {
   }
 }
 
-// ========== 全局当前代理节点变量，防止未定义报错 ==========
-let currentNode = null;
+// 全局当前代理节点变量（确保唯一声明）
+
+currentNode = null;
 
 // ========== 增强分流智能学习与多维度分析 ========== 
 const nodeProfileDB = new Map(); // 节点多维度历史档案
