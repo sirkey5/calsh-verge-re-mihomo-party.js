@@ -9,7 +9,8 @@ class AppState {
     BASE_QUARANTINE_DURATION: 24 * 60 * 60 * 1000,
     
     NODE_EXPIRE_TIME: 30 * 24 * 60 * 60 * 1000,
-    NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000
+    NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000,
+    QUARANTINE_EXIT_SCORE: 0.7 // Added: Score threshold to exit quarantine
   });
 
   static nodes = Object.freeze({
@@ -48,6 +49,10 @@ class RollingStats {
 
   get average() {
     return this._weightedAverage();
+  }
+
+  get values() { // Added getter to be consistent with singbox's probeEndpoint usage
+    return this.fullWindow;
   }
 
   _weightedAverage() {
@@ -101,17 +106,56 @@ class CentralManager {
   static instance = new this();
   constructor() {
     this.manager = CentralManager.instance;
-    // Placeholder for Prober, replace with actual implementation
+    this.currentPremiumNode = null; // Explicitly initialize current premium node
+    this.connectionPool = { // Mock connection pool
+      hasIdleConnections: () => false, // Placeholder
+      releaseFailedConnection: (url) => console.log(`[ConnectionPool] Released connection for ${url} (mock)`) // Placeholder
+    };
+    // Actual Prober implementation
     this.prober = {
-      probeTCP: async (url) => ({ avgLatency: 200, packetLossRate: 0, jitter: 10 }),
-      probeUDP: async (url) => ({ avgLatency: 200, packetLossRate: 0, jitter: 10 }),
-      checkHttpStatus: async (url) => ({ statusCode: 200 })
+      probeTCP: async (url) => {
+        // Actual TCP probing is complex and environment-dependent.
+        // This might require native modules or external tools.
+        // Placeholder returning a mock success for now.
+        console.log(`[Prober.probeTCP] Mock TCP probe for ${url}`);
+        return { avgLatency: Math.random() * 100 + 50, packetLossRate: Math.random() * 0.05, jitter: Math.random() * 20 };
+      },
+      probeUDP: async (url) => {
+        // Actual UDP probing is also complex and environment-dependent.
+        // Placeholder returning a mock success for now.
+        console.log(`[Prober.probeUDP] Mock UDP probe for ${url}`);
+        return { avgLatency: Math.random() * 120 + 60, packetLossRate: Math.random() * 0.07, jitter: Math.random() * 25 };
+      },
+      checkHttpStatus: async (url) => {
+        console.log(`[Prober.checkHttpStatus] HTTP probe for ${url}`);
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 seconds timeout
+          const response = await fetch(url, { method: 'HEAD', signal: controller.signal, mode: 'no-cors' }); // 'no-cors' for basic check, status might be 0
+          clearTimeout(timeoutId);
+          // For 'no-cors' requests, we can't directly access status for cross-origin, 
+          // but a successful fetch (no error) indicates reachability.
+          // If a more precise status is needed, CORS headers must be set on the server.
+          // Or, if running in a Node.js environment with a library like 'node-fetch', full response is available.
+          // Assuming success if no error is thrown for 'no-cors' in browser-like env.
+          return { statusCode: response.ok ? 200 : (response.status || 503) }; // response.status might be 0 for opaque 'no-cors' responses
+        } catch (error) {
+          console.error(`[Prober.checkHttpStatus] Error probing ${url}: ${error.message}`);
+          return { statusCode: 503 }; // Service Unavailable or other error
+        }
+      }
     };
     this.metricsRegistry = new Map([
       ['latency', new RollingStats()],
       ['packetLoss', new RollingStats()],
+      ['jitter', new RollingStats()], // Added: Jitter tracking
       ['successRate', new SuccessRateTracker()]
     ]);
+    this.trafficPatterns = new Map([
+      ['latency', []],
+      ['loss', []],
+      ['success', []] // For success rate patterns
+    ]); // Initialize trafficPatterns
     this.cdnPool = [
       'https://cdn.jsdelivr.net/gh/',
       'https://fastly.jsdelivr.net/gh/',
@@ -121,7 +165,6 @@ class CentralManager {
     this.failureCounts = new Map();
     this.nodeStats = new Map();
     this.quarantinedNodes = new Set();
-    this.trafficPatterns = new Map();
     this.historyWindow = 24 * 60 * 60 * 1000;
   }
 
@@ -135,44 +178,48 @@ class CentralManager {
   }
 
   _getTrafficFactor(metricType) {
-    // Placeholder implementation for traffic factor calculation
-    // This should be replaced with actual logic based on traffic patter    const trafficData = this.trafficPatterns.get(metricType) || [];
-    // 增加成功率趋势分析
-const successPatterns = this.trafficPatterns.get('success') || [];
-const successTrend = successPatterns.length > 3 
-  ? successPatterns.slice(-3).reduce((a,b) => a + (b > 0.8 ? 1 : -1), 0)
-  : 0;
+    // This method calculates a dynamic weighting factor for a given metric type,
+    // adopting logic from singbox for consistency.
+    const trafficData = this.trafficPatterns.get(metricType) || [];
+    const successPatterns = this.trafficPatterns.get('success') || [];
+    const successTrend = successPatterns.length > 3
+      ? successPatterns.slice(-3).reduce((a, b) => a + (b > 0.8 ? 1 : -1), 0)
+      : 0;
 
-if (trafficData.length < 5) {
-  return successTrend > 0 ? 0.28 : 0.38; // 根据成功趋势调整默认权重
-}
+    if (trafficData.length < 5) {
+      // Default weight based on success trend if not enough traffic data
+      return successTrend > 0 ? 0.28 : 0.38;
+    }
 
-    // Simulate a more concrete logic: analyze the trend of the last 5 data points
-    const recentData = trafficData.slice(-5);
+    // Analyze the trend of the last 5 data points
+    const recentData = trafficData.slice(-5); // trafficData.length is >= 5 here
     const averageRecent = recentData.reduce((a, b) => a + b, 0) / recentData.length;
     const averageOverall = trafficData.reduce((a, b) => a + b, 0) / trafficData.length;
 
     let factor = 0.33; // Base factor
 
-    // If recent average is significantly higher than overall, increase weight for that metric
     if (averageRecent > averageOverall * 1.2) {
-      factor = 0.45;
+      factor = 0.45; // Higher weight if recent performance is much better
     } else if (averageRecent < averageOverall * 0.8) {
-      factor = 0.20;
+      factor = 0.20; // Lower weight if recent performance is much worse
     }
 
-    // Specific adjustments based on metric type
-    if (metricType === 'latency') {
-      // If latency is trending up, prioritize it more
-      return trafficData[trafficData.length -1] > trafficData[trafficData.length -2] ? Math.min(0.5, factor + 0.1) : Math.max(0.2, factor - 0.05);
+    // Specific adjustments based on metric type, with early return
+    if (trafficData.length >= 2) { // Check if there's enough data for trend
+      const lastValue = trafficData[trafficData.length - 1];
+      const secondLastValue = trafficData[trafficData.length - 2];
+      if (metricType === 'latency') {
+        return lastValue > secondLastValue ? Math.min(0.5, factor + 0.1) : Math.max(0.2, factor - 0.05);
+      }
+      if (metricType === 'loss') {
+        return lastValue > secondLastValue ? Math.min(0.5, factor + 0.15) : Math.max(0.15, factor - 0.05);
+      }
     }
-    if (metricType === 'loss') {
-      // If packet loss is trending up, prioritize it more
-      return trafficData[trafficData.length -1] > trafficData[trafficData.length -2] ? Math.min(0.5, factor + 0.15) : Math.max(0.15, factor - 0.05);
-    }
-    // 增加网络质量衰减系数
-const qualityDecay = Math.exp(-Date.now()/this.historyWindow);
-return Math.max(0.1, Math.min(0.6, factor * (0.9 + qualityDecay*0.2)));
+    
+    // Apply network quality decay factor if no early return for latency/loss trend
+    const historyWindowMs = this.historyWindow || (24 * 60 * 60 * 1000); // Use this.historyWindow
+    const qualityDecay = Math.exp(-Date.now() / historyWindowMs);
+    return Math.max(0.1, Math.min(0.6, factor * (0.9 + qualityDecay * 0.2)));
   }
 
   /**
@@ -245,29 +292,33 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
   }
 
   // 统一健康检查
+
+  _handleUnhealthyOrError(url, failures) {
+    // 实时网络质量评估
+    const latencyMetrics = this.metricsRegistry.get('latency');
+    const currentLatencyValues = (latencyMetrics && Array.isArray(latencyMetrics.fullWindow) && latencyMetrics.fullWindow.slice(-3)) || [];
+    
+    const networkScore = currentLatencyValues.length > 0
+      ? currentLatencyValues.reduce((a, b) => a + b, 0) / currentLatencyValues.length
+      : Infinity;
+
+    const networkScoreThreshold = 800; 
+    return networkScore < networkScoreThreshold ? this._rotateCDN(url) : this._handleFailure(url, failures);
+  }
+
   async performHealthCheck(url) {
     const failures = this.failureCounts.get(url) || 0;
     try {
       const metrics = await this.probeEndpoint(url);
       if (this._isUnhealthy(metrics)) {
-        // 实时网络质量评估
-const currentMetrics = this.metricsRegistry.get('latency').values.slice(-3);
-const networkScore = currentMetrics.length > 0 
-  ? currentMetrics.reduce((a, b) => a + b, 0) / currentMetrics.length 
-  : Infinity;
-
-return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, failures);
+        console.warn(`[CentralManager.performHealthCheck] Node ${url} is unhealthy. Metrics:`, JSON.stringify(metrics));
+        return this._handleUnhealthyOrError(url, failures);
       }
       this._updateAllMetrics(url, metrics);
       return true;
     } catch (e) {
-      // 实时网络质量评估
-const currentMetrics = this.metricsRegistry.get('latency').values.slice(-3);
-const networkScore = currentMetrics.length > 0 
-  ? currentMetrics.reduce((a, b) => a + b, 0) / currentMetrics.length 
-  : Infinity;
-
-return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, failures);
+      console.error(`[CentralManager.performHealthCheck] Error during health check for ${url}: ${e.message}. Stack: ${e.stack}`);
+      return this._handleUnhealthyOrError(url, failures);
     }
   }
 
@@ -282,19 +333,22 @@ return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, fail
     };
   }
 
-  _normalizeMetrics(tcp, udp) {
+  _normalizeMetrics(tcp, udp, http) { // Added http parameter
     return {
       latency: tcp.avgLatency,
       packetLoss: tcp.packetLossRate,
       jitter: udp.jitter,
+      httpStatusCode: http ? http.statusCode : null, // Utilize httpResult
       timestamp: Date.now()
     };
   }
 
   _isUnhealthy(metrics) {
     const thresholds = this.dynamicThresholds;
+    const isHttpError = metrics.httpStatusCode !== null && (metrics.httpStatusCode < 200 || metrics.httpStatusCode >= 400);
     return metrics.latency > thresholds.latency || 
-           metrics.packetLoss > thresholds.packetLoss;
+           metrics.packetLoss > thresholds.packetLoss ||
+           isHttpError; // Added HTTP status check
   }
 
   /**
@@ -341,6 +395,105 @@ return networkScore < 800 ? this._rotateCDN(url) : this._handleFailure(url, fail
     return Math.min(1.2, 1 + (currentJitter / 50));
   }
 
+  _getJitterStdDev() {
+    const jitterStats = this.metricsRegistry.get('jitter');
+    // Ensure there are enough data points to calculate standard deviation meaningfully
+    if (jitterStats && jitterStats.fullWindow && jitterStats.fullWindow.length > 1) {
+      const values = jitterStats.fullWindow;
+      const mean = values.reduce((a, b) => a + b, 0) / values.length;
+      // Corrected variance calculation (sum of squared differences from mean)
+      const variance = values.reduce((sumSqDiff, val) => sumSqDiff + Math.pow(val - mean, 2), 0) / values.length;
+      if (variance < 0) return 5; // Should not happen with Math.pow, but as a safeguard
+      return Math.sqrt(variance);
+    }
+    // Return a default or indicative value if insufficient data
+    return 10; // Default jitter standard deviation (e.g., 10ms)
+  }
+
+  _updateAllMetrics(url, metrics) {
+    console.log(`[CentralManager._updateAllMetrics] Updating metrics for ${url}:`, metrics);
+    const nodeStat = this.nodeStats.get(url) || {};
+    nodeStat.latency = metrics.latency;
+    nodeStat.packetLoss = metrics.packetLoss;
+    nodeStat.jitter = metrics.jitter;
+    nodeStat.httpStatusCode = metrics.httpStatusCode;
+    nodeStat.lastUpdateTime = metrics.timestamp;
+    const isCurrentlyHealthy = !this._isUnhealthy(metrics);
+    // Simplified success rate update: (previous rate * decay) + (current_status * weight)
+    // Ensure nodeStat.successRate is initialized if it's undefined
+    const previousSuccessRate = typeof nodeStat.successRate === 'number' ? nodeStat.successRate : 0.9; // Default to 0.9 if undefined
+    nodeStat.successRate = previousSuccessRate * 0.9 + (isCurrentlyHealthy ? 0.1 : 0);
+    this.nodeStats.set(url, nodeStat);
+
+    if (metrics.latency !== Infinity && typeof metrics.latency === 'number') this.metricsRegistry.get('latency').add(metrics.latency);
+    if (metrics.packetLoss !== 1 && typeof metrics.packetLoss === 'number') this.metricsRegistry.get('packetLoss').add(metrics.packetLoss);
+    if (metrics.jitter !== Infinity && typeof metrics.jitter === 'number') this.metricsRegistry.get('jitter').add(metrics.jitter);
+    this.metricsRegistry.get('successRate').add(isCurrentlyHealthy);
+
+    this.failureCounts.set(url, 0); // Reset failure count on successful update
+
+    // Update traffic patterns
+    if (metrics.latency !== Infinity && typeof metrics.latency === 'number') {
+      const latencyPattern = this.trafficPatterns.get('latency') || [];
+      latencyPattern.push(metrics.latency);
+      if (latencyPattern.length > 100) latencyPattern.shift(); // Keep last 100 entries
+      this.trafficPatterns.set('latency', latencyPattern);
+    }
+    if (metrics.packetLoss !== 1 && typeof metrics.packetLoss === 'number') {
+      const lossPattern = this.trafficPatterns.get('loss') || [];
+      lossPattern.push(metrics.packetLoss);
+      if (lossPattern.length > 100) lossPattern.shift(); // Keep last 100 entries
+      this.trafficPatterns.set('loss', lossPattern);
+    }
+    const successPattern = this.trafficPatterns.get('success') || [];
+    successPattern.push(isCurrentlyHealthy ? 1 : 0); // 1 for success, 0 for failure
+    if (successPattern.length > 100) successPattern.shift(); // Keep last 100 entries
+    this.trafficPatterns.set('success', successPattern);
+    // Note: For persistent storage or more advanced analytics of trafficPatterns,
+    // consider integrating with a database or a more robust data logging
+  }
+
+  _rotateCDN(url) {
+    console.log(`[CDN Rotation] Attempting to rotate CDN due to issues with ${url}. Current active index: ${this.activeIndex}`);
+    const oldActiveCDN = this.cdnPool[this.activeIndex];
+    this.activeIndex = (this.activeIndex + 1) % this.cdnPool.length;
+    const newActiveCDN = this.cdnPool[this.activeIndex];
+    console.log(`[CDN Rotation] Rotated from ${oldActiveCDN} to ${newActiveCDN}.`);
+
+    // Reset failure count for the URL that triggered rotation, as we are moving away from it.
+    this.failureCounts.set(url, 0);
+    
+    // It might also be prudent to set a cooldown for the newly activated CDN to prevent immediate re-evaluation or flapping.
+    // Example: AppState.nodes.switchCooldown.set(newActiveCDN, Date.now() + 60000); // 1 minute cooldown
+
+    return true; // Indicate rotation occurred
+  }
+
+  _isNodeFaulty(url) {
+    const stats = this.nodeStats.get(url);
+    if (!stats) {
+        console.log(`[Node Faulty Check] No stats for ${url}, considering faulty.`);
+        return true; // If no stats, consider it faulty or unknown
+    }
+
+    const thresholds = this.dynamicThresholds; // Assuming this.dynamicThresholds is available and provides { latency, packetLoss }
+    
+    // Check current metrics against dynamic thresholds
+    // A node might be considered faulty if its current performance is significantly worse than acceptable levels.
+    const isMetricsBad = (stats.latency !== undefined && stats.latency > thresholds.latency * 1.5) || // e.g., 50% worse than threshold
+                         (stats.packetLoss !== undefined && stats.packetLoss > thresholds.packetLoss * 1.5);
+    
+    // Note: Calling _calculateStabilityScore here might lead to recursion if _isNodeFaulty is called from _handleFailure,
+    // which itself calls _calculateStabilityScore. This needs careful handling.
+
+    if (isMetricsBad) {
+        console.log(`[Node Faulty Check] Node ${url} considered faulty due to bad metrics. Latency: ${stats.latency}, Packet Loss: ${stats.packetLoss}`);
+        return true;
+    }
+    // console.log(`[Node Faulty Check] Node ${url} considered NOT faulty.`);
+    return false;
+  }
+
   _calculateStabilityScore(url) {
     const stats = this.nodeStats.get(url) || { successRate: 0.9, latency: 300, packetLoss: 0, jitter: 0, historicalSuccess: [], continuousStableDays: 0, lastAccessTime: Date.now() };
 
@@ -361,14 +514,28 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     const isPremiumCandidate = (successRateComponent > 0.85 && latencyComponent > 0.8 && packetLossComponent > 0.9) || 
       (successRateComponent + latencyComponent + packetLossComponent > 2.4);
     
-    if (isPremiumCandidate && !this.currentPremiumNode) {
-      this.currentPremiumNode = {
-        url,
-        score: successRateComponent + latencyComponent + packetLossComponent,
-        timestamp: Date.now(),
-        stability: networkQualityFactor
-      };
-      console.log(`[优质节点标记] ${url} 综合评分${this.currentPremiumNode.score.toFixed(2)}`);
+    if (isPremiumCandidate) {
+      const newScore = successRateComponent + latencyComponent + packetLossComponent;
+      // Update if no current premium node or if the new node has a better score
+      if (!this.currentPremiumNode || newScore > this.currentPremiumNode.score) {
+        this.currentPremiumNode = {
+          url,
+          score: newScore,
+          timestamp: Date.now(),
+          stability: networkQualityFactor // networkQualityFactor was already calculated
+        };
+        console.log(`[优质节点标记更新] ${url} 被标记为新的优质节点，综合评分 ${this.currentPremiumNode.score.toFixed(2)}`);
+      } else if (this.currentPremiumNode && url === this.currentPremiumNode.url) {
+        // If the current premium node is being re-evaluated and is still a premium candidate, update its score
+        this.currentPremiumNode.score = newScore;
+        this.currentPremiumNode.timestamp = Date.now();
+        this.currentPremiumNode.stability = networkQualityFactor;
+        // console.log(`[优质节点刷新] ${url} 优质节点状态刷新，综合评分 ${this.currentPremiumNode.score.toFixed(2)}`); // Optional: uncomment for more verbose logging
+      }
+    } else if (this.currentPremiumNode && this.currentPremiumNode.url === url) {
+      // If the current premium node is no longer a premium candidate (e.g., its score dropped), clear it.
+      console.log(`[优质节点移除] ${url} (原优质节点) 不再符合优质节点条件，已被移除。`);
+      this.currentPremiumNode = null;
     }
 
     return Math.min(0.95,
@@ -381,6 +548,73 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
   }
 
   /**
+   * 获取最优节点。
+   * @returns {string} 最优节点的URL。
+   */
+  getBestNode() {
+    if (!this.cdnPool || this.cdnPool.length === 0) {
+      console.error("[CentralManager.getBestNode] CDN pool is empty!");
+      return null;
+    }
+
+    let bestNode = null;
+    let highestScore = -Infinity;
+
+    // Consider the current premium node first if it's healthy
+    if (this.currentPremiumNode && !this.quarantinedNodes.has(this.currentPremiumNode.url)) {
+        const premiumScore = this._calculateStabilityScore(this.currentPremiumNode.url);
+        // Add a bias for the premium node if its score is still good
+        if (premiumScore > (AppState.THRESHOLDS.QUARANTINE || 0.5) * 1.2) { // e.g., 20% above quarantine threshold
+            // console.log(`[CentralManager.getBestNode] Prioritizing premium node ${this.currentPremiumNode.url} with score ${premiumScore.toFixed(3)}`);
+            return this.currentPremiumNode.url;
+        }
+    }
+    
+    // Iterate through all available (non-quarantined) nodes in the cdnPool
+    for (const nodeUrl of this.cdnPool) {
+      if (this.quarantinedNodes.has(nodeUrl)) {
+        // console.log(`[CentralManager.getBestNode] Skipping quarantined node ${nodeUrl}`);
+        continue;
+      }
+
+      // Check if node is on cooldown for switching
+      const cooldownEndTime = AppState.nodes.switchCooldown.get(nodeUrl);
+      if (cooldownEndTime && Date.now() < cooldownEndTime) {
+        // console.log(`[CentralManager.getBestNode] Node ${nodeUrl} is on switch cooldown. Skipping.`);
+        continue;
+      }
+
+      const score = this._calculateStabilityScore(nodeUrl);
+      // console.log(`[CentralManager.getBestNode] Node ${nodeUrl} score: ${score.toFixed(3)}`);
+
+      if (score > highestScore) {
+        highestScore = score;
+        bestNode = nodeUrl;
+      }
+    }
+
+    if (bestNode) {
+      // console.log(`[CentralManager.getBestNode] Selected best node: ${bestNode} with score ${highestScore.toFixed(3)}`);
+      // Update activeIndex if the best node is different from the current active one
+      const bestNodeIndex = this.cdnPool.indexOf(bestNode);
+      if (bestNodeIndex !== -1 && bestNodeIndex !== this.activeIndex) {
+          // console.log(`[CentralManager.getBestNode] Updating activeIndex from ${this.activeIndex} to ${bestNodeIndex}`);
+          this.activeIndex = bestNodeIndex;
+      }
+      return bestNode;
+    }
+
+    // Fallback: if all nodes are problematic or scores are equal, return current active or first non-quarantined
+    // console.warn("[CentralManager.getBestNode] No clearly best node found, returning current active or first available.");
+    const fallbackNode = this.cdnPool.find(url => !this.quarantinedNodes.has(url)) || this.cdnPool[this.activeIndex] || this.cdnPool[0];
+    if (fallbackNode) {
+        const fallbackIndex = this.cdnPool.indexOf(fallbackNode);
+        if (fallbackIndex !== -1 && fallbackIndex !== this.activeIndex) this.activeIndex = fallbackIndex;
+    }
+    return fallbackNode || null;
+  }
+
+  /**
    * 处理探测失败或节点不健康的情况。
    * 根据失败次数和节点稳定性评分决定是增加失败计数、切换CDN还是隔离节点。
    * @param {string} url - 发生故障的节点URL。
@@ -390,17 +624,17 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
   _handleFailure(url, failures) {
     // 优质节点保护机制
     const newScore = this._calculateStabilityScore(url);
-    if (this.currentPremiumNode && newScore < this.currentPremiumNode.score * 1.5) {
-      console.log(`[优质节点保护] 新节点评分${newScore}未达阈值（需${this.currentPremiumNode.score * 1.5}），保持当前节点`);
+    if (this.currentPremiumNode && this.currentPremiumNode.url !== url && newScore < this.currentPremiumNode.score * 1.5) {
+      console.log(`[优质节点保护] 候选节点 ${url} 评分 ${newScore.toFixed(2)} 未达当前优质节点 ${this.currentPremiumNode.url} 评分 (${this.currentPremiumNode.score.toFixed(2)}) 的1.5倍阈值，保持当前优质节点`);
       return false;
     }
-    // 优质节点保护前置检查
-    if (this.currentPremiumNode && !this._isNodeFaulty(this.currentPremiumNode.url)) {
-      const currentScore = this._calculateStabilityScore(this.currentPremiumNode.url);
-      const candidateScore = this._calculateStabilityScore(url);
+    // 优质节点保护前置检查 (如果当前节点不是优质节点，或者当前优质节点本身就有问题)
+    if (this.currentPremiumNode && this.currentPremiumNode.url !== url && !this._isNodeFaulty(this.currentPremiumNode.url)) {
+      const currentPremiumScore = this._calculateStabilityScore(this.currentPremiumNode.url);
+      const candidateScore = newScore; // Already calculated
       
-      if (candidateScore < currentScore * 1.5) {
-        console.log(`[节点保护] 候选节点评分${candidateScore}未达阈值（需${currentScore * 1.5}），禁止切换`);
+      if (candidateScore < currentPremiumScore * 1.5) {
+        console.log(`[节点保护] 候选节点 ${url} 评分 ${candidateScore.toFixed(2)} 未达当前优质节点 ${this.currentPremiumNode.url} (${currentPremiumScore.toFixed(2)}) 的1.5倍切换阈值，禁止切换`);
         return false;
       }
     }
@@ -409,33 +643,24 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     if(this.connectionPool?.hasIdleConnections()) {
       this.connectionPool.releaseFailedConnection(url);
     }
-    const stabilityScore = this._calculateStabilityScore(url);
+    const stabilityScore = this._calculateStabilityScore(url); // Recalculate or use newScore if it's the same logic for the failing URL
     
+    const baseCooldown = 300000; // 5 minutes base
 
-    // 冷却时间计算：基础冷却时间（至少1小时）加上基于稳定性评分调整的部分。
-    // 稳定性越低，(1.5 - stabilityScore)越大，额外冷却时间越长。
-    const baseCooldown = 300000; // 5 minutes base for switch, quarantine has its own duration logic
-    const nodeSpecificCooldown = Math.max(3600000, baseCooldown * (1.5 - stabilityScore)); // Min 1 hour for quarantine consideration, or dynamic for switch
-
-    this.failureCounts.set(url, failures + 1);
+    const updatedFailures = (this.failureCounts.get(url) || 0) + 1;
+    this.failureCounts.set(url, updatedFailures);
     
-    // 失败阈值：至少3次失败，或者失败次数达到稳定性评分的两倍（评分低则更容易达到阈值）。
-    const failureThreshold = Math.max(3, Math.floor(2 / Math.max(0.1, stabilityScore))); // Inverse relationship with stability score for threshold
+    const failureThreshold = Math.max(3, Math.floor(2 / Math.max(0.1, stabilityScore)));
 
-    if (failures + 1 >= failureThreshold) { 
+    if (updatedFailures >= failureThreshold) { 
       if (stabilityScore < (AppState.THRESHOLDS.QUARANTINE || 0.5)) {
-        // 稳定性评分低于隔离阈值，则隔离节点并安排审查。
+        console.log(`[CentralManager._handleFailure] Node ${url} failed ${updatedFailures} times and stability ${stabilityScore.toFixed(2)} is below quarantine threshold. Quarantining.`);
         this._quarantineNode(url);
-        this._scheduleNodeReview(url); // Schedule for long-term review
+        this._scheduleNodeReview(url); // Schedule review after quarantine
       } else {
-        // 未达到隔离条件，则切换到下一个CDN，并重置失败计数。
-        // 设置切换冷却时间，避免过于频繁的切换。
-        this.activeIndex = (this.activeIndex + 1) % this.cdnPool.length;
-        this.failureCounts.set(url, 0); // Reset failures for the failing node as we are switching away
-        
-        // Cooldown for the *newly selected* activeIndex to prevent immediate switch-back or rapid cycling
-        const switchCooldownDuration = baseCooldown * (1 + (1 - this._calculateStabilityScore(this.cdnPool[this.activeIndex])) * 3); // Cooldown based on new node's stability
-        AppState.nodes.switchCooldown.set(this.cdnPool[this.activeIndex], Date.now() + switchCooldownDuration);
+        console.log(`[CentralManager._handleFailure] Node ${url} failed ${updatedFailures} times but stability ${stabilityScore.toFixed(2)} is above quarantine threshold. Rotating CDN.`);
+        this._rotateCDN(url); 
+        this.failureCounts.set(url, 0); // Reset failure for this node as CDN is rotated.
       }
     }
     return false;
@@ -447,40 +672,52 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
    * @param {string} url - 需要隔离的节点URL。
    */
   _quarantineNode(url) {
-    const nodeStat = this.nodeStats.get(url) || {}; // Ensure nodeStat is an object
-    if (nodeStat.reviewTimer) {
-      clearInterval(nodeStat.reviewTimer);
-      nodeStat.reviewTimer = null; // Clear timer ID
+    const nodeStat = this.nodeStats.get(url) || {};
+    // Clear review timer if it exists, as quarantine implies a different state management
+    if (nodeStat.reviewTimer) { 
+        clearTimeout(nodeStat.reviewTimer); 
+        nodeStat.reviewTimer = null;
     }
+    // Clear any existing quarantine timer before setting a new one
+    if (nodeStat.quarantineTimer) {
+        clearTimeout(nodeStat.quarantineTimer);
+    }
+
     this.quarantinedNodes.add(url);
-    // 隔离持续时间：基础隔离时间乘以 (1 - 稳定性评分)。评分越低，隔离时间越长。
     const stabilityScore = this._calculateStabilityScore(url);
-    
+    const baseQuarantineDuration = AppState.THRESHOLDS.BASE_QUARANTINE_DURATION || (24 * 60 * 60 * 1000);
+    // Ensure quarantineDuration is a positive value, stabilityScore can be up to 0.95
+    const quarantineDurationFactor = Math.max(0.1, 1 - stabilityScore);
+    const quarantineDuration = baseQuarantineDuration * quarantineDurationFactor;
 
-    const baseQuarantineDuration = (AppState.THRESHOLDS.BASE_QUARANTINE_DURATION || (24 * 60 * 60 * 1000));
-    const quarantineDuration = baseQuarantineDuration * Math.max(0.1, (1 - stabilityScore)); // Ensure some minimum duration factor
+    console.log(`[CentralManager._quarantineNode] Node ${url} quarantined for ${quarantineDuration / (60 * 1000)} minutes. Stability: ${stabilityScore.toFixed(2)}`);
 
-    // 设置定时器，在隔离期满后检查节点是否恢复，若恢复则移出隔离区。
-    const timer = setTimeout(() => {
-      // Re-calculate score at the end of quarantine
-      if (this._calculateStabilityScore(url) > (AppState.THRESHOLDS.QUARANTINE_EXIT_SCORE || 0.7)) { // Use a configurable exit score
-        this.quarantinedNodes.delete(url);
-        const currentStat = this.nodeStats.get(url);
-        if (currentStat) {
-            // If it had a quarantine timer, it should be this one. Clear it.
-            if (currentStat.quarantineTimer === timer) currentStat.quarantineTimer = null;
-            // Optionally, reschedule review if needed, or let natural health checks take over.
+    const timerId = setTimeout(async () => {
+        const statInTimeout = this.nodeStats.get(url) || {};
+        statInTimeout.quarantineTimer = null; // Clear this timer as it's executing
+
+        // Perform a fresh probe to determine current health
+        const metricsForCheck = await this.probeEndpoint(url);
+        const stillUnhealthy = this._isUnhealthy(metricsForCheck);
+        // Update node stats with fresh probe data before calculating score
+        if (metricsForCheck.latency !== Infinity) this._updateAllMetrics(url, metricsForCheck);
+        const currentScore = this._calculateStabilityScore(url); // Recalculate score based on fresh data
+
+        if (currentScore > (AppState.THRESHOLDS.QUARANTINE_EXIT_SCORE || 0.7) && !stillUnhealthy) {
+            this.quarantinedNodes.delete(url); 
+            console.log(`[CentralManager._quarantineNode] Node ${url} recovered (score: ${currentScore.toFixed(2)}, healthy) and removed from quarantine.`);
+            this.failureCounts.set(url, 0); 
+        } else {
+            this.quarantinedNodes.add(url); // Ensure it remains in quarantine if still unhealthy
+            console.warn(`[CentralManager._quarantineNode] Node ${url} still unhealthy (score: ${currentScore.toFixed(2)}, unhealthy: ${stillUnhealthy}, metrics: ${JSON.stringify(metricsForCheck)}) after quarantine period. Remains quarantined.`);
+            // Optionally, schedule a follow-up review or extend quarantine
+            // this._scheduleNodeReview(url, AppState.THRESHOLDS.NODE_INACTIVE_TIME); // Schedule a longer-term review
         }
-      } else {
-        // Node still unhealthy, could extend quarantine or log for manual review
-        console.warn(`[${url}] Node still unhealthy after quarantine period.`);
-        // Optionally, re-schedule another, possibly longer, quarantine period or different handling.
-      }
+        this.nodeStats.set(url, statInTimeout); // Save updated stats
     }, quarantineDuration);
 
-    // 存储隔离定时器ID，以便需要时可以清除（例如，手动解除隔离）。
-    nodeStat.quarantineTimer = timer;
-    this.nodeStats.set(url, nodeStat); // Ensure updated stat object is saved
+    nodeStat.quarantineTimer = timerId;
+    this.nodeStats.set(url, nodeStat); // Save stat with new quarantine timer
   }
 
   /**
@@ -489,45 +726,43 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
    * 如果节点不再被隔离，则停止审查。
    * @param {string} url - 需要安排审查的节点URL。
    */
-  _scheduleNodeReview(url) {
-    let nodeStat = this.nodeStats.get(url);
-    if (!nodeStat) {
-        nodeStat = {}; // Initialize if not present
-        this.nodeStats.set(url, nodeStat);
-    }
-    // If there's an existing review timer for this node, clear it before setting a new one.
+  _scheduleNodeReview(url, delay = AppState.THRESHOLDS.NODE_INACTIVE_TIME / 2) {
+    const nodeStat = this.nodeStats.get(url) || {};
+    // Clear existing review timer for this node to avoid duplicates
     if (nodeStat.reviewTimer) {
-        clearInterval(nodeStat.reviewTimer);
+      clearTimeout(nodeStat.reviewTimer);
     }
 
-    const reviewInterval = 24 * 60 * 60 * 1000; // Daily review
+    console.log(`[CentralManager._scheduleNodeReview] Scheduling review for ${url} in ${delay / (60 * 1000)} minutes.`);
+    nodeStat.reviewTimer = setTimeout(async () => {
+      const statInTimeout = this.nodeStats.get(url) || {}; // Get fresh stats
+      statInTimeout.reviewTimer = null; // Clear this timer as it's executing
+      
+      console.log(`[CentralManager._scheduleNodeReview] Performing scheduled review for ${url}.`);
+      // A health check implies probing and updating metrics, which performHealthCheck does.
+      const isHealthy = await this.performHealthCheck(url); 
 
-    const timerId = setInterval(() => {
-      const currentStat = this.nodeStats.get(url); // Get the latest stat object
-      if (!currentStat) { 
-          clearInterval(timerId); // Node stat somehow removed, stop timer
-          return;
+      if (isHealthy) {
+        console.log(`[CentralManager._scheduleNodeReview] Node ${url} passed scheduled review.`);
+        statInTimeout.lastReviewTime = Date.now();
+        // If it was quarantined and now passes review, it might be eligible to exit quarantine.
+        // However, _quarantineNode handles its own exit logic. This review is more general.
+        if (this.quarantinedNodes.has(url)) {
+            const currentScore = this._calculateStabilityScore(url);
+            if (currentScore > (AppState.THRESHOLDS.QUARANTINE_EXIT_SCORE || 0.7)) {
+                this.quarantinedNodes.delete(url);
+                this.failureCounts.set(url, 0);
+                console.log(`[CentralManager._scheduleNodeReview] Node ${url} also exited quarantine due to successful review.`);
+            }
+        }
+      } else {
+        console.warn(`[CentralManager._scheduleNodeReview] Node ${url} failed scheduled review. May need further action.`);
+        // If it failed review and is not already quarantined, consider quarantining or other actions.
+        // if (!this.quarantinedNodes.has(url)) { this._quarantineNode(url); }
       }
-      // Ensure the timerId on the stat object is current, in case of multiple calls or race conditions.
-      // This helps in correctly clearing this specific interval later.
-      currentStat.reviewTimer = timerId; 
-
-      if (!this.quarantinedNodes.has(url)) {
-        clearInterval(timerId);
-        currentStat.reviewTimer = null; // Clear timer ID from stat
-        // this.nodeStats.set(url, currentStat); // Persist change if necessary, though often not needed if only clearing
-        return;
-      }
-      // 记录长期性能指标
-      currentStat.longTermMetrics = {
-        avgLatency: this._calculate90DayAverage(url, 'latency'),
-        successRate: this._calculate90DayAverage(url, 'successRate'),
-        lastReview: Date.now()
-      };
-      // this.nodeStats.set(url, currentStat); // Persist updated metrics, if not done implicitly by reference
-    }, reviewInterval);
-    nodeStat.reviewTimer = timerId; // Store initial timerId on the stat object
-    // this.nodeStats.set(url, nodeStat); // Ensure stat object with new timerId is saved
+      this.nodeStats.set(url, statInTimeout); // Save updated stats
+    }, delay);
+    this.nodeStats.set(url, nodeStat); // Save stat with the new timerId
   }
 
   /**
