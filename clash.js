@@ -55,25 +55,28 @@ class RollingStats {
     return this.fullWindow;
   }
 
+  static _WEIGHTS = { full: 0.7, sampled: 0.3 };
+
   _weightedAverage() {
-    const fullWeight = 0.7;
-    const sampledWeight = 0.3;
-    
+    const { full: fullWeight, sampled: sampledWeight } = RollingStats._WEIGHTS;
     const fullSum = this.fullWindow.reduce((a, b) => a + b, 0);
     const sampledSum = this.sampledWindow.reduce((a, b) => a + b, 0);
-    
-    return (fullSum * fullWeight / Math.max(1, this.fullWindow.length)) + 
-           (sampledSum * sampledWeight / Math.max(1, this.sampledWindow.length));
+    const fullLength = Math.max(1, this.fullWindow.length);
+    const sampledLength = Math.max(1, this.sampledWindow.length);
+    return (fullSum * fullWeight / fullLength) + (sampledSum * sampledWeight / sampledLength);
   }
 
   get recentData() {
-    return [...this.fullWindow, ...this.sampledWindow];
+    // 缓存合并结果提升性能
+    if (!this._cachedRecentData) {
+      this._cachedRecentData = [...this.fullWindow, ...this.sampledWindow];
+    }
+    return this._cachedRecentData;
   }
 }
 
 class SuccessRateTracker {
   constructor() {
-    this.currentPremiumNode = null; // 当前优质节点标记
     this.successes = 0;
     this.total = 0;
   }
@@ -95,17 +98,11 @@ class SuccessRateTracker {
  */
 const enable = true
 
-// 提取公共CDN配置
-
-
-
-
-// NetworkProber功能已整合至CentralManager
+// 提取公共CDN配置（整合至CentralManager）
 
 class CentralManager {
   static instance = new this();
   constructor() {
-    this.manager = CentralManager.instance;
     this.currentPremiumNode = null; // Explicitly initialize current premium node
     this.connectionPool = { // Mock connection pool
       hasIdleConnections: () => false, // Placeholder
@@ -265,9 +262,9 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     // TCP探测超时：基础超时 * 1.2 * sqrt(平滑RTT/基准RTT)，更容忍网络波动
     // UDP探测超时：基础超时 * 0.8 * sqrt(平滑RTT/基准RTT) * (1 + RTT标准差/基准RTT)，对UDP的快速响应有更高要求，但考虑抖动
     // HTTP探测超时：基础超时 * 2，通常HTTP请求涉及更多处理，给予更长时间
-    const tcpTimeout = baseTimeout * 1.2 * Math.sqrt(Math.max(50, smoothedRTT) / 200); // Ensure smoothedRTT is not too small
-    const udpTimeout = baseTimeout * 0.8 * Math.sqrt(Math.max(50, smoothedRTT) / 200) * (1 + rttStdDevCalc / 200);
-    const httpTimeout = baseTimeout * 2;
+    const tcpTimeout = this._calculateTimeout(baseTimeout, smoothedRTT, rttStdDevCalc, 'tcp');
+    const udpTimeout = this._calculateTimeout(baseTimeout, smoothedRTT, rttStdDevCalc, 'udp');
+    const httpTimeout = this._calculateTimeout(baseTimeout, smoothedRTT, rttStdDevCalc, 'http');
 
     const [tcpResult, udpResult, httpResult] = await Promise.all([
       Promise.race([this.prober.probeTCP(url), timeoutPromise(tcpTimeout)]),
@@ -397,20 +394,21 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
 
   _getJitterStdDev() {
     const jitterStats = this.metricsRegistry.get('jitter');
-    // Ensure there are enough data points to calculate standard deviation meaningfully
-    if (jitterStats && jitterStats.fullWindow && jitterStats.fullWindow.length > 1) {
-      const values = jitterStats.fullWindow;
-      const mean = values.reduce((a, b) => a + b, 0) / values.length;
-      // Corrected variance calculation (sum of squared differences from mean)
-      const variance = values.reduce((sumSqDiff, val) => sumSqDiff + Math.pow(val - mean, 2), 0) / values.length;
-      if (variance < 0) return 5; // Should not happen with Math.pow, but as a safeguard
-      return Math.sqrt(variance);
-    }
-    // Return a default or indicative value if insufficient data
-    return 10; // Default jitter standard deviation (e.g., 10ms)
+    if (!jitterStats?.fullWindow?.length || jitterStats.fullWindow.length < 2) return 10;
+    const values = jitterStats.fullWindow;
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const variance = values.reduce((sum, val) => sum + (val - mean) ** 2, 0) / values.length;
+    return Math.sqrt(Math.max(0, variance));
   }
 
   _updateAllMetrics(url, metrics) {
+    this._updateTrafficPattern = (metricType, value) => {
+      if (value === Infinity || typeof value !== 'number') return;
+      const pattern = this.trafficPatterns.get(metricType) || [];
+      pattern.push(value);
+      if (pattern.length > 100) pattern.shift();
+      this.trafficPatterns.set(metricType, pattern);
+    };
     console.log(`[CentralManager._updateAllMetrics] Updating metrics for ${url}:`, metrics);
     const nodeStat = this.nodeStats.get(url) || {};
     nodeStat.latency = metrics.latency;
@@ -419,10 +417,8 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     nodeStat.httpStatusCode = metrics.httpStatusCode;
     nodeStat.lastUpdateTime = metrics.timestamp;
     const isCurrentlyHealthy = !this._isUnhealthy(metrics);
-    // Simplified success rate update: (previous rate * decay) + (current_status * weight)
-    // Ensure nodeStat.successRate is initialized if it's undefined
-    const previousSuccessRate = typeof nodeStat.successRate === 'number' ? nodeStat.successRate : 0.9; // Default to 0.9 if undefined
-    nodeStat.successRate = previousSuccessRate * 0.9 + (isCurrentlyHealthy ? 0.1 : 0);
+    // 指数平滑更新成功率（α=0.1）
+    nodeStat.successRate = (typeof nodeStat.successRate === 'number' ? nodeStat.successRate : 0.9) * 0.9 + (isCurrentlyHealthy ? 0.1 : 0);
     this.nodeStats.set(url, nodeStat);
 
     if (metrics.latency !== Infinity && typeof metrics.latency === 'number') this.metricsRegistry.get('latency').add(metrics.latency);
@@ -433,22 +429,9 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     this.failureCounts.set(url, 0); // Reset failure count on successful update
 
     // Update traffic patterns
-    if (metrics.latency !== Infinity && typeof metrics.latency === 'number') {
-      const latencyPattern = this.trafficPatterns.get('latency') || [];
-      latencyPattern.push(metrics.latency);
-      if (latencyPattern.length > 100) latencyPattern.shift(); // Keep last 100 entries
-      this.trafficPatterns.set('latency', latencyPattern);
-    }
-    if (metrics.packetLoss !== 1 && typeof metrics.packetLoss === 'number') {
-      const lossPattern = this.trafficPatterns.get('loss') || [];
-      lossPattern.push(metrics.packetLoss);
-      if (lossPattern.length > 100) lossPattern.shift(); // Keep last 100 entries
-      this.trafficPatterns.set('loss', lossPattern);
-    }
-    const successPattern = this.trafficPatterns.get('success') || [];
-    successPattern.push(isCurrentlyHealthy ? 1 : 0); // 1 for success, 0 for failure
-    if (successPattern.length > 100) successPattern.shift(); // Keep last 100 entries
-    this.trafficPatterns.set('success', successPattern);
+    this._updateTrafficPattern('latency', metrics.latency);
+    this._updateTrafficPattern('loss', metrics.packetLoss);
+    this._updateTrafficPattern('success', isCurrentlyHealthy ? 1 : 0);
     // Note: For persistent storage or more advanced analytics of trafficPatterns,
     // consider integrating with a database or a more robust data logging
   }
@@ -877,6 +860,13 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
   }
 
   _updateAllMetrics(url, metrics) {
+    this._updateTrafficPattern = (metricType, value) => {
+      if (value === Infinity || typeof value !== 'number') return;
+      const pattern = this.trafficPatterns.get(metricType) || [];
+      pattern.push(value);
+      if (pattern.length > 100) pattern.shift();
+      this.trafficPatterns.set(metricType, pattern);
+    };
     // 确保 jitter 指标收集器存在并添加数据
     const jitterCollector = this.metricsRegistry.get('jitter');
     if (jitterCollector && metrics.jitter !== undefined && isFinite(metrics.jitter)) {
