@@ -4,15 +4,6 @@
 // ===================================
 
 class AppState {
-  static THRESHOLDS = Object.freeze({
-    QUARANTINE: 0.5,
-    BASE_QUARANTINE_DURATION: 24 * 60 * 60 * 1000,
-    
-    NODE_EXPIRE_TIME: 30 * 24 * 60 * 60 * 1000,
-    NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000,
-    QUARANTINE_EXIT_SCORE: 0.7 // Added: Score threshold to exit quarantine
-  });
-
   static nodes = Object.freeze({
     qualityStatus: new Map(),
     lastSwitch: new Map(),
@@ -45,6 +36,9 @@ class RollingStats {
         this.sampledWindow.shift();
       }
     }
+
+    // 数据更新时清除缓存
+    this._cachedRecentData = null;
   }
 
   get average() {
@@ -67,9 +61,10 @@ class RollingStats {
   }
 
   get recentData() {
-    // 缓存合并结果提升性能
-    if (!this._cachedRecentData) {
+    // 缓存合并结果提升性能，每10次更新后失效
+    if (!this._cachedRecentData || this._cacheCounter >= 10) {
       this._cachedRecentData = [...this.fullWindow, ...this.sampledWindow];
+      this._cacheCounter = 0;
     }
     return this._cachedRecentData;
   }
@@ -102,6 +97,13 @@ const enable = true
 
 class CentralManager {
   static instance = new this();
+  static THRESHOLDS = Object.freeze({
+    QUARANTINE: 0.5,
+    BASE_QUARANTINE_DURATION: 24 * 60 * 60 * 1000,
+    NODE_EXPIRE_TIME: 30 * 24 * 60 * 60 * 1000,
+    NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000,
+    QUARANTINE_EXIT_SCORE: 0.7 // Added: Score threshold to exit quarantine
+  });
   constructor() {
     this.currentPremiumNode = null; // Explicitly initialize current premium node
     this.connectionPool = { // Mock connection pool
@@ -128,7 +130,8 @@ class CentralManager {
         try {
           const controller = new AbortController();
           const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 seconds timeout
-          const response = await fetch(url, { method: 'HEAD', signal: controller.signal, mode: 'no-cors' }); // 'no-cors' for basic check, status might be 0
+          const response = await fetch(url, { method: 'HEAD', signal: controller.signal, mode: 'cors' }); // 改用cors模式获取准确状态码
+    if (response.status === 0) throw new Error('CORS请求被阻止'); // 处理CORS错误
           clearTimeout(timeoutId);
           // For 'no-cors' requests, we can't directly access status for cross-origin, 
           // but a successful fetch (no error) indicates reachability.
@@ -230,16 +233,10 @@ class CentralManager {
     
     try {
       // 基础超时时间计算：基于平均延迟和抖动标准差动态调整，确保在1秒到5秒之间。
-      const avgLatency = (this.metricsRegistry.get('latency') && this.metricsRegistry.get('latency').average) || 200; // Default to 200ms if no data
+      const avgLatency = (this.metricsRegistry.get('latency')?.average) || 200; // Default to 200ms if no data
       const jitterStdDev = this._getJitterStdDev(); // Already handles empty/invalid data
-      // 引入动态衰减因子和网络质量系数
-const networkQualityFactor = Math.min(2, Math.max(0.5, 
-  (1 - this.metricsRegistry.get('packetLoss').average) * 
-  (1 / (1 + Math.log(avgLatency/100 + 1)))
-));
-const baseTimeout = Math.min(3000, Math.max(800, 
-  (avgLatency * 1.5 + jitterStdDev * 2) * networkQualityFactor
-));
+      const networkQualityFactor = this._calculateNetworkQualityFactor(avgLatency);
+      const baseTimeout = this._calculateBaseTimeout(avgLatency, jitterStdDev, networkQualityFactor);
 
       // RTT值和统计计算，用于后续的动态超时调整和EMA滤波
       const rttValues = (this.metricsRegistry.get('latency') && this.metricsRegistry.get('latency').values) || [];
@@ -262,9 +259,10 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     // TCP探测超时：基础超时 * 1.2 * sqrt(平滑RTT/基准RTT)，更容忍网络波动
     // UDP探测超时：基础超时 * 0.8 * sqrt(平滑RTT/基准RTT) * (1 + RTT标准差/基准RTT)，对UDP的快速响应有更高要求，但考虑抖动
     // HTTP探测超时：基础超时 * 2，通常HTTP请求涉及更多处理，给予更长时间
-    const tcpTimeout = this._calculateTimeout(baseTimeout, smoothedRTT, rttStdDevCalc, 'tcp');
-    const udpTimeout = this._calculateTimeout(baseTimeout, smoothedRTT, rttStdDevCalc, 'udp');
-    const httpTimeout = this._calculateTimeout(baseTimeout, smoothedRTT, rttStdDevCalc, 'http');
+    // 计算各协议探测超时时间
+    const tcpTimeout = this._calculateProtocolTimeout(baseTimeout, 'tcp');
+    const udpTimeout = this._calculateProtocolTimeout(baseTimeout, 'udp');
+    const httpTimeout = this._calculateProtocolTimeout(baseTimeout, 'http');
 
     const [tcpResult, udpResult, httpResult] = await Promise.all([
       Promise.race([this.prober.probeTCP(url), timeoutPromise(tcpTimeout)]),
@@ -401,14 +399,15 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     return Math.sqrt(Math.max(0, variance));
   }
 
+  _updateMetricPattern(metricType, value) {
+    if (value === Infinity || typeof value !== 'number') return;
+    const pattern = this.trafficPatterns.get(metricType) || [];
+    pattern.push(value);
+    if (pattern.length > 100) pattern.shift();
+    this.trafficPatterns.set(metricType, pattern);
+  }
+
   _updateAllMetrics(url, metrics) {
-    this._updateTrafficPattern = (metricType, value) => {
-      if (value === Infinity || typeof value !== 'number') return;
-      const pattern = this.trafficPatterns.get(metricType) || [];
-      pattern.push(value);
-      if (pattern.length > 100) pattern.shift();
-      this.trafficPatterns.set(metricType, pattern);
-    };
     console.log(`[CentralManager._updateAllMetrics] Updating metrics for ${url}:`, metrics);
     const nodeStat = this.nodeStats.get(url) || {};
     nodeStat.latency = metrics.latency;
@@ -428,10 +427,10 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
 
     this.failureCounts.set(url, 0); // Reset failure count on successful update
 
-    // Update traffic patterns
-    this._updateTrafficPattern('latency', metrics.latency);
-    this._updateTrafficPattern('loss', metrics.packetLoss);
-    this._updateTrafficPattern('success', isCurrentlyHealthy ? 1 : 0);
+    // Update traffic patterns using class method
+    this._updateMetricPattern('latency', metrics.latency);
+    this._updateMetricPattern('loss', metrics.packetLoss);
+    this._updateMetricPattern('success', isCurrentlyHealthy ? 1 : 0);
     // Note: For persistent storage or more advanced analytics of trafficPatterns,
     // consider integrating with a database or a more robust data logging
   }
@@ -487,9 +486,9 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
   (0.9 - (stats.historicalSuccess.length > 100 ? 0.15 : 0));
     const networkQualityFactor = this._calculateNetworkQualityFactor(stats);
 
-    const successRateComponent = (stats.successRate || 0.9) * 0.6 * networkQualityFactor;
-    const latencyComponent = Math.exp(-(stats.latency || 300) / 800) * 0.15 * timeDecayFactor;
-    const packetLossComponent = (1 - (stats.packetLoss || 0)) * 0.1;
+    const successRateComponent = this._calculateSuccessRateComponent(stats, networkQualityFactor);
+    const latencyComponent = this._calculateLatencyComponent(stats, timeDecayFactor);
+    const packetLossComponent = this._calculatePacketLossComponent(stats);
 
     // Incorporate real-time latency, packet loss, and success rate with adjusted weights
     // 自动标记优质节点
@@ -859,14 +858,15 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     });
   }
 
+  _updateMetricPattern(metricType, value) {
+    if (value === Infinity || typeof value !== 'number') return;
+    const pattern = this.trafficPatterns.get(metricType) || [];
+    pattern.push(value);
+    if (pattern.length > 100) pattern.shift();
+    this.trafficPatterns.set(metricType, pattern);
+  }
+
   _updateAllMetrics(url, metrics) {
-    this._updateTrafficPattern = (metricType, value) => {
-      if (value === Infinity || typeof value !== 'number') return;
-      const pattern = this.trafficPatterns.get(metricType) || [];
-      pattern.push(value);
-      if (pattern.length > 100) pattern.shift();
-      this.trafficPatterns.set(metricType, pattern);
-    };
     // 确保 jitter 指标收集器存在并添加数据
     const jitterCollector = this.metricsRegistry.get('jitter');
     if (jitterCollector && metrics.jitter !== undefined && isFinite(metrics.jitter)) {
@@ -889,6 +889,11 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
       lastUpdate: Date.now(),
       // 初始化 accessCount 如果它还不存在
       accessCount: (currentNodeStats.accessCount || 0)
+    });
+
+    // 统一更新流量模式
+    ['latency','loss','success'].forEach(metric => {
+      if(metrics[metric] !== undefined) this._updateTrafficPattern(metric, metrics[metric]);
     });
 
     // 更新其他指标收集器
@@ -1394,13 +1399,8 @@ const ruleProviderCommon = {
 }
 
 // 代理组通用配置
-const groupBaseOption = {
-  interval: 300,
-  timeout: 5000,
-  url: 'https://cp.cloudflare.com/generate_204',  // 使用HTTPS进行健康检查
-  lazy: true,
-  'max-failed-times': 3,
-  'health-check': {
+// 公共健康检查配置
+  const commonHealthCheck = {
     enable: true,
     interval: 30,       // 检测间隔30秒
     timeout: 2000,      // 超时2秒
@@ -1410,34 +1410,43 @@ const groupBaseOption = {
     udp: true,         // 新增UDP检测
     udpPort: 53,       // UDP检测端口
     udpTimeout: 1000   // UDP检测超时时间
-  },
-  'check-interval': 300,
-  'fail-timeout': 5,
-  'success-rate': 0.8,
-  hidden: false,
-  'tls-fingerprint': 'chrome',  // 使用Chrome的TLS指纹
-  'skip-cert-verify': false,     // 强制启用证书验证
-  maxRetries: 3,
-  retryDelay: 1000,
-  fallbackPolicy: 'roundrobin',
-  protocol: 'tcp_udp',
-  weight: {
-    base: 100,
-    rttFactor: 0.7,
-    errorPenalty: 30,
-    jitterFactor: 0.3,  // 新增抖动系数
-    packetLossPenalty: 20, // 新增丢包惩罚
-    // 权重公式：weight = base - (rtt * rttFactor) - (errorCount * errorPenalty) - (jitter * jitterFactor) - (packetLoss * packetLossPenalty)
-    // RTT单位毫秒，errorCount为最近5分钟错误次数
-  },
-  'load-balance': {
-    strategy: 'weighted',  // 修正为官方支持的策略名称
-    minRttWeight: 0.5,        // 最小RTT权重
-    maxRttWeight: 1.5,        // 最大RTT权重
-    jitterWeight: 0.2,        // 抖动权重
-    packetLossWeight: 0.3     // 丢包权重
+  };
+
+  // 代理组通用配置
+  const groupBaseOption = {
+    interval: 300,
+    timeout: 5000,
+    url: 'https://cp.cloudflare.com/generate_204',  // 使用HTTPS进行健康检查
+    lazy: true,
+    'max-failed-times': 3,
+    'health-check': commonHealthCheck,
+    'check-interval': 300,
+    'fail-timeout': 5,
+    'success-rate': 0.8,
+    hidden: false,
+    'tls-fingerprint': 'chrome',  // 使用Chrome的TLS指纹
+    'skip-cert-verify': false,     // 强制启用证书验证
+    maxRetries: 3,
+    retryDelay: 1000,
+    fallbackPolicy: 'roundrobin',
+    protocol: 'tcp_udp',
+    weight: {
+      base: 100,
+      rttFactor: 0.7,
+      errorPenalty: 30,
+      jitterFactor: 0.3,  // 新增抖动系数
+      packetLossPenalty: 20, // 新增丢包惩罚
+      // 权重公式：weight = base - (rtt * rttFactor) - (errorCount * errorPenalty) - (jitter * jitterFactor) - (packetLoss * packetLossPenalty)
+      // RTT单位毫秒，errorCount为最近5分钟错误次数
+    },
+    'load-balance': {
+      strategy: 'weighted',  // 修正为官方支持的策略名称
+      minRttWeight: 0.5,        // 最小RTT权重
+      maxRttWeight: 1.5,        // 最大RTT权重
+      jitterWeight: 0.2,        // 抖动权重
+      packetLossWeight: 0.3     // 丢包权重
+    }
   }
-}
 
 // 全局规则提供者定义
 const ruleProviders = new Map()
@@ -2140,16 +2149,17 @@ ruleProviders.set('ai', {
     })
   }
 
-  if (ruleOptions.tracker) {
-    // rules.push('GEOSITE,tracker,跟踪分析') // 原始规则，会导致错误
-    config['proxy-groups'].push({
-      ...groupBaseOption,
-      name: '跟踪分析',
-      type: 'select',
-      proxies: ['REJECT', '直连', '默认节点'],
-      icon: 'https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Reject.png',
-    })
-  }
+  // tracker规则已禁用，移除冗余代理组配置
+  // if (ruleOptions.tracker) {
+  //   // rules.push('GEOSITE,tracker,跟踪分析') // 原始规则，会导致错误
+  //   config['proxy-groups'].push({
+  //     ...groupBaseOption,
+  //     name: '跟踪分析',
+  //     type: 'select',
+  //     proxies: ['REJECT', '直连', '默认节点'],
+  //     icon: 'https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Reject.png',
+  //   })
+  // }
 
   if (ruleOptions.ads) {
     rules.push('GEOSITE,category-ads-all,广告过滤')
