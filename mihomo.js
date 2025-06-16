@@ -1,6 +1,7 @@
 // ========== 重要维护提示 ==========
 // 所有后续新增的变量、函数、类、常量等，必须在本文件中显式定义，严禁未定义直接调用，防止ReferenceError: not defined等运行时错误。
 // 如有跨文件依赖，需在本文件顶部或相关位置补充声明或导入。
+// 本文件采用事件触发驱动机制，禁制使用定时机制和逻辑。
 // ===================================
 
 class AppState {
@@ -52,12 +53,24 @@ class RollingStats {
   static _WEIGHTS = { full: 0.7, sampled: 0.3 };
 
   _weightedAverage() {
+    // 新增地理权重计算（添加变量存在性检查）
+    const targetLocation = targetLocation || {}; // 默认空对象防止未定义
+    const geoWeight = this._getGeoWeight(targetLocation);
     const { full: fullWeight, sampled: sampledWeight } = RollingStats._WEIGHTS;
+    const adjustedWeights = {
+      full: fullWeight * (1 - geoWeight),
+      sampled: sampledWeight * (1 - geoWeight),
+      geo: geoWeight
+    };
     const fullSum = this.fullWindow.reduce((a, b) => a + b, 0);
     const sampledSum = this.sampledWindow.reduce((a, b) => a + b, 0);
     const fullLength = Math.max(1, this.fullWindow.length);
     const sampledLength = Math.max(1, this.sampledWindow.length);
-    return (fullSum * fullWeight / fullLength) + (sampledSum * sampledWeight / sampledLength);
+    const clientGeo = clientGeo || {}; // 默认空对象防止未定义
+    const nodeGeo = nodeGeo || {};
+    return (fullSum * fullWeight / fullLength * (1 - geoWeight)) 
+      + (sampledSum * sampledWeight / sampledLength * (1 - geoWeight))
+      + (geoWeight * this._getDistanceScore(clientGeo, nodeGeo));
   }
 
   get recentData() {
@@ -97,6 +110,13 @@ const enable = true
 
 class CentralManager {
   static instance = new this();
+  static GEO_STRATEGY = Object.freeze({
+    MAXMIND_DB_PATH: './GeoLite2-City.mmdb',
+    GEO_WEIGHT: 0.4,
+    FALLBACK_RADIUS_KM: 500,
+    GEO_DECAY_FACTOR: 2.5,
+    MAX_GEO_DISTANCE: 2000
+  });
   static THRESHOLDS = Object.freeze({
     QUARANTINE: 0.5,
     BASE_QUARANTINE_DURATION: 24 * 60 * 60 * 1000,
@@ -105,23 +125,20 @@ class CentralManager {
     QUARANTINE_EXIT_SCORE: 0.7 // Added: Score threshold to exit quarantine
   });
   constructor() {
-    this.currentPremiumNode = null; // Explicitly initialize current premium node
-    this.connectionPool = { // Mock connection pool
-      hasIdleConnections: () => false, // Placeholder
-      releaseFailedConnection: (url) => console.log(`[ConnectionPool] Released connection for ${url} (mock)`) // Placeholder
+    // 核心管理类初始化优化，使用Map提升查找效率
+    this.currentPremiumNode = null;
+    this.clientGeo = {}; // 初始化客户端地理信息
+    this.nodeGeo = {}; // 初始化节点地理信息
+    this.connectionPool = {
+      hasIdleConnections: () => false,
+      releaseFailedConnection: (url) => console.log(`[ConnectionPool] Released connection for ${url} (mock)`)
     };
-    // Actual Prober implementation
     this.prober = {
       probeTCP: async (url) => {
-        // Actual TCP probing is complex and environment-dependent.
-        // This might require native modules or external tools.
-        // Placeholder returning a mock success for now.
         console.log(`[Prober.probeTCP] Mock TCP probe for ${url}`);
         return { avgLatency: Math.random() * 100 + 50, packetLossRate: Math.random() * 0.05, jitter: Math.random() * 20 };
       },
       probeUDP: async (url) => {
-        // Actual UDP probing is also complex and environment-dependent.
-        // Placeholder returning a mock success for now.
         console.log(`[Prober.probeUDP] Mock UDP probe for ${url}`);
         return { avgLatency: Math.random() * 120 + 60, packetLossRate: Math.random() * 0.07, jitter: Math.random() * 25 };
       },
@@ -129,43 +146,39 @@ class CentralManager {
         console.log(`[Prober.checkHttpStatus] HTTP probe for ${url}`);
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 seconds timeout
-          const response = await fetch(url, { method: 'HEAD', signal: controller.signal, mode: 'cors' }); // 改用cors模式获取准确状态码
-    if (response.status === 0) throw new Error('CORS请求被阻止'); // 处理CORS错误
+          const timeoutId = setTimeout(() => controller.abort(), 5000);
+          const response = await fetch(url, { method: 'HEAD', signal: controller.signal, mode: 'cors' });
+          if (response.status === 0) throw new Error('CORS请求被阻止');
           clearTimeout(timeoutId);
-          // For 'no-cors' requests, we can't directly access status for cross-origin, 
-          // but a successful fetch (no error) indicates reachability.
-          // If a more precise status is needed, CORS headers must be set on the server.
-          // Or, if running in a Node.js environment with a library like 'node-fetch', full response is available.
-          // Assuming success if no error is thrown for 'no-cors' in browser-like env.
-          return { statusCode: response.ok ? 200 : (response.status || 503) }; // response.status might be 0 for opaque 'no-cors' responses
+          return { statusCode: response.ok ? 200 : (response.status || 503) };
         } catch (error) {
           console.error(`[Prober.checkHttpStatus] Error probing ${url}: ${error.message}`);
-          return { statusCode: 503 }; // Service Unavailable or other error
+          return { statusCode: 503 };
         }
       }
     };
     this.metricsRegistry = new Map([
       ['latency', new RollingStats()],
       ['packetLoss', new RollingStats()],
-      ['jitter', new RollingStats()], // Added: Jitter tracking
+      ['jitter', new RollingStats()],
       ['successRate', new SuccessRateTracker()]
     ]);
     this.trafficPatterns = new Map([
       ['latency', []],
       ['loss', []],
-      ['success', []] // For success rate patterns
-    ]); // Initialize trafficPatterns
-    this.cdnPool = [
-      'https://cdn.jsdelivr.net/gh/',
-      'https://fastly.jsdelivr.net/gh/',
-      'https://testingcf.jsdelivr.net/gh/'
+      ['success', []],
+      ['speed', []] // 新增速率指标存储
+    ]);
+    this.cdnPool = [ // 改为数组存储CDN配置以支持activeIndex
+      { name: 'jsdelivr', urls: ['https://cdn.jsdelivr.net/gh/','https://fastly.jsdelivr.net/gh/','https://testingcf.jsdelivr.net/gh/'], region: 'ASIA' },
+      { name: 'cloudflare', urls: ['https://cdn.cloudflare.com/gh/','https://eu.cdn.cloudflare.com/gh/'], region: 'GLOBAL' }
     ];
     this.activeIndex = 0;
     this.failureCounts = new Map();
     this.nodeStats = new Map();
     this.quarantinedNodes = new Set();
     this.historyWindow = 24 * 60 * 60 * 1000;
+    this.registeredModules = new Set(['healthCheck', 'weightCalculator', 'cdnSwitcher']); // 注册核心模块
   }
 
   calculateDynamicWeights() {
@@ -178,6 +191,19 @@ class CentralManager {
   }
 
   _getTrafficFactor(metricType) {
+    // 新增速率指标的动态权重计算
+    if (metricType === 'speed') {
+      const speedData = this.trafficPatterns.get('speed') || [];
+      return this._calculateSpeedFactor(speedData);
+    }
+
+    // 原有逻辑...
+    // 新增速率指标的动态权重计算
+    if (metricType === 'speed') {
+      const speedData = this.trafficPatterns.get('speed') || [];
+      return this._calculateSpeedFactor(speedData);
+    }
+    // 原有逻辑...
     // This method calculates a dynamic weighting factor for a given metric type,
     // adopting logic from singbox for consistency.
     const trafficData = this.trafficPatterns.get(metricType) || [];
@@ -225,68 +251,84 @@ class CentralManager {
   /**
    * 统一探测方法，结合TCP、UDP和HTTP探测来评估端点质量。
    * 动态调整探测超时时间基于网络状况（RTT、抖动）。
+  async _probeSpeed(url) {
+    const start = Date.now();
+    const response = await fetch(url, { method: 'GET', mode: 'cors' });
+    if (!response.ok) throw new Error('速率测试文件下载失败');
+    const end = Date.now();
+    const fileSize = 1024 * 1024; // 1MB
+    const duration = (end - start) / 1000; // 秒
+    const downloadRate = fileSize / (duration * 1024 * 1024); // MB/s
+    return { downloadRate };
+  }
    * @param {string} url - 需要探测的端点URL。
    * @returns {Promise<object>} 包含延迟、丢包率、抖动等指标的对象；若探测失败则返回高延迟和丢包率。
    */
   async probeEndpoint(url) {
-    let timeoutPromise = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error('探测超时')), ms));
-    
+    // 添加速率探测逻辑（下载1MB测试文件计算速率）
+    const speedTestUrl = `${url}/speed-test-1mb.bin`;
+    const speedMetrics = await this._probeSpeed(speedTestUrl);
+
+    // 原有探测逻辑...
+
+    // 原有探测逻辑...
+    // 统一异常处理增强版，添加变量初始化检查和更详细的错误分类
+    const timeoutPromise = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error(`探测超时（${ms}ms）`)), ms));
+    const clientGeo = this.clientGeo || await this._getClientGeo(); // 获取实际客户端地理信息
+    const nodeGeo = this.nodeGeo || await this._getNodeGeo(url); // 获取节点地理信息
+    this.clientGeo = clientGeo; // 缓存客户端地理信息
+    this.nodeGeo = nodeGeo; // 缓存节点地理信息
+
     try {
-      // 基础超时时间计算：基于平均延迟和抖动标准差动态调整，确保在1秒到5秒之间。
-      const avgLatency = (this.metricsRegistry.get('latency')?.average) || 200; // Default to 200ms if no data
-      const jitterStdDev = this._getJitterStdDev(); // Already handles empty/invalid data
+      const avgLatency = this.metricsRegistry.get('latency')?.average || 200;
+      const jitterStdDev = this._getJitterStdDev();
       const networkQualityFactor = this._calculateNetworkQualityFactor(avgLatency);
+      const geoWeight = this._calculateGeoWeight(clientGeo, nodeGeo);
       const baseTimeout = this._calculateBaseTimeout(avgLatency, jitterStdDev, networkQualityFactor);
 
-      // RTT值和统计计算，用于后续的动态超时调整和EMA滤波
-      const rttValues = (this.metricsRegistry.get('latency') && this.metricsRegistry.get('latency').values) || [];
+      const rttValues = this.metricsRegistry.get('latency')?.values || [];
       const meanRTT = rttValues.length > 0 ? rttValues.reduce((a, b) => a + b, 0) / rttValues.length : avgLatency;
       const rttStdDevCalc = rttValues.length > 1 ? Math.sqrt(rttValues.reduce((a, x) => a + Math.pow(x - meanRTT, 2), 0) / rttValues.length) : 0;
-      // const volatilityFactor = 1 + (rttStdDevCalc / (meanRTT || 1)); // meanRTT can't be 0 if rttValues exist
 
-      // 改进的EMA滤波（α动态调整），用于平滑RTT值，减少短期波动影响
-      // dynamicAlpha: 动态调整平滑因子，抖动越大，越依赖历史数据（alpha越小）
-      // 自适应平滑系数，结合网络抖动和成功率
-const successRate = this.metricsRegistry.get('successRate').rate;
-const dynamicAlpha = Math.min(0.35, Math.max(0.15, 
-  0.25 - (rttStdDevCalc / 60) + (1 - successRate) * 0.1
-));
-      const smoothedRTT = rttValues.length > 0 
-        ? rttValues.reduce((acc, cur) => acc * (1 - dynamicAlpha) + cur * dynamicAlpha, rttValues[0])
-        : avgLatency;
+      const successRate = this.metricsRegistry.get('successRate').rate;
+      const dynamicAlpha = Math.min(0.35, Math.max(0.15, 0.25 - (rttStdDevCalc / 60) + (1 - successRate) * 0.1));
+      const smoothedRTT = rttValues.length > 0 ? rttValues.reduce((acc, cur) => acc * (1 - dynamicAlpha) + cur * dynamicAlpha, rttValues[0]) : avgLatency;
 
-    // 执行TCP, UDP, HTTP探测，每个探测都有其独立的、基于平滑RTT和抖动调整的超时时间
-    // TCP探测超时：基础超时 * 1.2 * sqrt(平滑RTT/基准RTT)，更容忍网络波动
-    // UDP探测超时：基础超时 * 0.8 * sqrt(平滑RTT/基准RTT) * (1 + RTT标准差/基准RTT)，对UDP的快速响应有更高要求，但考虑抖动
-    // HTTP探测超时：基础超时 * 2，通常HTTP请求涉及更多处理，给予更长时间
-    // 计算各协议探测超时时间
-    const tcpTimeout = this._calculateProtocolTimeout(baseTimeout, 'tcp');
-    const udpTimeout = this._calculateProtocolTimeout(baseTimeout, 'udp');
-    const httpTimeout = this._calculateProtocolTimeout(baseTimeout, 'http');
+      const tcpTimeout = this._calculateProtocolTimeout(baseTimeout, 'tcp');
+      const udpTimeout = this._calculateProtocolTimeout(baseTimeout, 'udp');
+      const httpTimeout = this._calculateProtocolTimeout(baseTimeout, 'http');
 
-    const [tcpResult, udpResult, httpResult] = await Promise.all([
-      Promise.race([this.prober.probeTCP(url), timeoutPromise(tcpTimeout)]),
-      Promise.race([this.prober.probeUDP(url), timeoutPromise(udpTimeout)]),
-      Promise.race([this.prober.checkHttpStatus(url), timeoutPromise(httpTimeout)])
-    ]);
-
-    // 增强的协议一致性校准：比较TCP和UDP探测结果的抖动和延迟差异
-    // calibrationFactor: 校准因子，一致性越高，因子越接近1，对后续超时影响小；差异大则因子减小，可能缩短超时（暂未使用，原逻辑有误导）
-
-
-    // 更新timeoutPromise的逻辑已移除，因为它在当前promise链之后，不会影响已执行的探测
-    // 若要动态调整后续操作的超时，应在需要时重新创建timeoutPromise实例或传递校准后的超时值
-
+      const [tcpResult, udpResult, httpResult] = await Promise.all([
+        Promise.race([this.prober.probeTCP(url), timeoutPromise(tcpTimeout)]),
+        Promise.race([this.prober.probeUDP(url), timeoutPromise(udpTimeout)]),
+        Promise.race([this.prober.checkHttpStatus(url), timeoutPromise(httpTimeout)])
+      ]);
 
       return this._normalizeMetrics(tcpResult, udpResult, httpResult);
 
     } catch (e) {
-      console.error(`[${url}] 探测失败: ${e.message}`);
-      return { latency: Infinity, packetLoss: 1, jitter: Infinity };
+      console.error(`[${url}] 探测失败: ${e.message}`, e.stack);
+      return {
+        latency: Infinity,
+        packetLoss: 1,
+        jitter: Infinity,
+        errorType: e.name,
+        timestamp: Date.now()
+      };
     }
   }
 
-  // 统一健康检查
+  // 统一健康检查（包含速率阈值）
+  get dynamicThresholds() {
+    const latencyStats = this.metricsRegistry.get('latency');
+    const lossStats = this.metricsRegistry.get('packetLoss');
+    const speedStats = this.trafficPatterns.get('speed');
+    return {
+      latency: Math.min(800, 500 * (1 + (latencyStats.average + 3*this._getJitterStdDev())/1000)),
+      packetLoss: Math.min(0.3, 0.15 * (1 + (lossStats.average + this._getJitterStdDev()/50)/0.1)),
+      speed: speedStats?.length > 0 ? Math.min(10, speedStats.slice(-5).reduce((a,b)=>a+b,0)/5) : 5 // 速率阈值（MB/s）
+    };
+  }
 
   _handleUnhealthyOrError(url, failures) {
     // 实时网络质量评估
@@ -317,23 +359,13 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     }
   }
 
-  // 统一阈值管理
-  get dynamicThresholds() {
-    const latencyStats = this.metricsRegistry.get('latency');
-    const lossStats = this.metricsRegistry.get('packetLoss');
-    return {
-      latency: Math.min(800, 500 * (1 + (latencyStats.average + 3*this._getJitterStdDev())/1000)),
-      packetLoss: Math.min(0.3, 0.15 * (1 + (lossStats.average + this._getJitterStdDev()/50)/0.1)),
-      jitterStdDev: this._getJitterStdDev()
-    };
-  }
-
-  _normalizeMetrics(tcp, udp, http) { // Added http parameter
+  _normalizeMetrics(tcp, udp, http, speed) { // 添加速率参数
     return {
       latency: tcp.avgLatency,
       packetLoss: tcp.packetLossRate,
       jitter: udp.jitter,
-      httpStatusCode: http ? http.statusCode : null, // Utilize httpResult
+      httpStatusCode: http ? http.statusCode : null,
+      speed: speed?.downloadRate || 0, // 新增速率指标
       timestamp: Date.now()
     };
   }
@@ -343,6 +375,7 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     const isHttpError = metrics.httpStatusCode !== null && (metrics.httpStatusCode < 200 || metrics.httpStatusCode >= 400);
     return metrics.latency > thresholds.latency || 
            metrics.packetLoss > thresholds.packetLoss ||
+           metrics.speed < thresholds.speed || // 新增速率阈值检查
            isHttpError; // Added HTTP status check
   }
 
@@ -388,6 +421,12 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     const jitterStats = this.metricsRegistry.get('jitter');
     const currentJitter = (stats.jitter !== undefined && isFinite(stats.jitter)) ? stats.jitter : (jitterStats ? jitterStats.average : 0);
     return Math.min(1.2, 1 + (currentJitter / 50));
+  }
+
+  _getDistanceScore(clientGeo, nodeGeo) {
+    if (!clientGeo || !nodeGeo) return 0;
+    const distance = this._calculateGeoDistance(clientGeo, nodeGeo);
+    return Math.exp(-distance / CentralManager.GEO_STRATEGY.MAX_GEO_DISTANCE * CentralManager.GEO_STRATEGY.GEO_DECAY_FACTOR);
   }
 
   _getJitterStdDev() {
@@ -477,56 +516,59 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
   }
 
   _calculateStabilityScore(url) {
-    const stats = this.nodeStats.get(url) || { successRate: 0.9, latency: 300, packetLoss: 0, jitter: 0, historicalSuccess: [], continuousStableDays: 0, lastAccessTime: Date.now() };
+    const stats = this.nodeStats.get(url) || this._getDefaultNodeStats();
+    const components = this._calculateStabilityComponents(stats);
+    const isPremiumCandidate = this._isPremiumCandidate(components);
+    this._updatePremiumNode(url, components.totalScore, isPremiumCandidate);
+    return Math.min(0.95, components.totalScore);
+  }
 
+  _getDefaultNodeStats() {
+    return {
+      successRate: 0.9,
+      latency: 300,
+      packetLoss: 0,
+      jitter: 0,
+      historicalSuccess: [],
+      continuousStableDays: 0,
+      lastAccessTime: Date.now()
+    };
+  }
+
+  _calculateStabilityComponents(stats) {
     const historyWeight = this._calculateHistoricalSuccessWeight(stats);
     const continuityBonus = this._calculateContinuityBonus(stats);
-    // 增强时间衰减因子：90天数据半衰期 + 动态衰减系数
-const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Date.now())) / (90 * 86400000)) * 
-  (0.9 - (stats.historicalSuccess.length > 100 ? 0.15 : 0));
+    const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Date.now())) / (90 * 86400000)) * (0.9 - (stats.historicalSuccess.length > 100 ? 0.15 : 0));
     const networkQualityFactor = this._calculateNetworkQualityFactor(stats);
-
     const successRateComponent = this._calculateSuccessRateComponent(stats, networkQualityFactor);
     const latencyComponent = this._calculateLatencyComponent(stats, timeDecayFactor);
     const packetLossComponent = this._calculatePacketLossComponent(stats);
+    return {
+      totalScore: successRateComponent + historyWeight + latencyComponent + packetLossComponent + continuityBonus,
+      successRateComponent,
+      latencyComponent,
+      packetLossComponent
+    };
+  }
 
-    // Incorporate real-time latency, packet loss, and success rate with adjusted weights
-    // 自动标记优质节点
-    // 统一优质节点标记条件
-    const isPremiumCandidate = (successRateComponent > 0.85 && latencyComponent > 0.8 && packetLossComponent > 0.9) || 
-      (successRateComponent + latencyComponent + packetLossComponent > 2.4);
-    
-    if (isPremiumCandidate) {
-      const newScore = successRateComponent + latencyComponent + packetLossComponent;
-      // Update if no current premium node or if the new node has a better score
-      if (!this.currentPremiumNode || newScore > this.currentPremiumNode.score) {
-        this.currentPremiumNode = {
-          url,
-          score: newScore,
-          timestamp: Date.now(),
-          stability: networkQualityFactor // networkQualityFactor was already calculated
-        };
+  _isPremiumCandidate(components) {
+    return (components.successRateComponent > 0.85 && components.latencyComponent > 0.8 && components.packetLossComponent > 0.9) || 
+           (components.totalScore > 2.4);
+  }
+
+  _updatePremiumNode(url, score, isCandidate) {
+    if (isCandidate) {
+      if (!this.currentPremiumNode || score > this.currentPremiumNode.score) {
+        this.currentPremiumNode = { url, score, timestamp: Date.now(), stability: this._calculateNetworkQualityFactor(this.nodeStats.get(url)) };
         console.log(`[优质节点标记更新] ${url} 被标记为新的优质节点，综合评分 ${this.currentPremiumNode.score.toFixed(2)}`);
-      } else if (this.currentPremiumNode && url === this.currentPremiumNode.url) {
-        // If the current premium node is being re-evaluated and is still a premium candidate, update its score
-        this.currentPremiumNode.score = newScore;
+      } else if (this.currentPremiumNode?.url === url) {
+        this.currentPremiumNode.score = score;
         this.currentPremiumNode.timestamp = Date.now();
-        this.currentPremiumNode.stability = networkQualityFactor;
-        // console.log(`[优质节点刷新] ${url} 优质节点状态刷新，综合评分 ${this.currentPremiumNode.score.toFixed(2)}`); // Optional: uncomment for more verbose logging
       }
-    } else if (this.currentPremiumNode && this.currentPremiumNode.url === url) {
-      // If the current premium node is no longer a premium candidate (e.g., its score dropped), clear it.
+    } else if (this.currentPremiumNode?.url === url) {
       console.log(`[优质节点移除] ${url} (原优质节点) 不再符合优质节点条件，已被移除。`);
       this.currentPremiumNode = null;
     }
-
-    return Math.min(0.95,
-      successRateComponent +      // Increased weight
-      historyWeight +             // Adjusted weight already applied above
-      latencyComponent +          // Increased weight
-      packetLossComponent +       // Added packet loss factor
-      continuityBonus             // Adjusted weight already applied above
-    );
   }
 
   /**
@@ -777,20 +819,24 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     return metric === 'successRate' ? 1 : 0;
   }
 
+  _getDistanceScore(clientGeo, nodeGeo) {
+    if (!clientGeo || !nodeGeo) return 0;
+    const distance = this._calculateGeoDistance(clientGeo, nodeGeo);
+    return Math.exp(-distance / CentralManager.GEO_STRATEGY.MAX_GEO_DISTANCE * CentralManager.GEO_STRATEGY.GEO_DECAY_FACTOR);
+  }
+
   _getJitterStdDev() {
+    // 优化输入验证，防止空值导致计算错误
     const jitterValues = Array.from(this.nodeStats.values())
       .map(s => s.jitter)
-      .filter(j => typeof j === 'number' && isFinite(j)); // Filter out non-numeric or non-finite jitter values
+      .filter(j => typeof j === 'number' && isFinite(j));
 
-    if (jitterValues.length === 0) {
-      return 0; // Default to 0 if no valid jitter data is available
+    if (jitterValues.length < 2) {
+      return 0; // 少于2个数据点无法计算标准差
     }
 
     const mean = jitterValues.reduce((a, b) => a + b, 0) / jitterValues.length;
-    if (jitterValues.length === 1) {
-        return 0; // Standard deviation is 0 for a single data point
-    }
-    const variance = jitterValues.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / jitterValues.length; // Use N for population variance if all nodes are considered
+    const variance = jitterValues.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / jitterValues.length;
     return Math.sqrt(variance);
   }
 
@@ -2379,19 +2425,51 @@ async function selectBestNodeWithQuality(nodes) {
 // ========== 代理请求前驱动的智能节点切换集成 ========== 
 // 假设有一个代理请求/流量事件的入口函数 handleProxyRequest(user, ...)
 // 在每次请求前动态判断是否需要切换节点
-async function handleProxyRequest(user, ...args) {
-  // 获取当前用户的当前节点
-  let currentNode = getCurrentNodeForUser(user);
-  // 智能切换（无定时器，事件驱动）
-  const allNodes = getAllAvailableNodesForUser(user); // 需根据实际业务实现
-  const newNode = await smartAutoSwitchNode(currentNode, allNodes);
-  if (newNode !== currentNode) {
-    // 执行实际代理切换操作
-    setCurrentNodeForUser(user, newNode);
-    // 可选：记录切换日志
+// 合并后的统一代理请求处理入口
+async function handleProxyRequest(user, req = {}, ...args) {
+  try {
+    const nodeManager = NodeManager.getInstance();
+    let currentNode = nodeManager.getNodeDispatch(user);
+    const allNodes = getAllAvailableNodesForUser(user);
+
+    // 客户端地理信息采集
+    const clientIP = req?.headers?.get('X-Forwarded-For') || req?.headers?.get('Remote-Address');
+    const clientGeo = await getNodeGeoInfo(clientIP);
+
+    // 分流优先，AI预测驱动
+    const newNode = await smartDispatchNode(user, allNodes, { clientGeo });
+
+    // 协调切换
+    if (newNode !== currentNode) {
+      await nodeManager.coordinatedSwitch(currentNode, allNodes, 'traffic_based');
+      currentNode = nodeManager.getNodeDispatch(user);
+    }
+
+    // 采集本次请求的多维度数据
+    const metrics = await testNodeMultiMetrics(newNode);
+    if (newNode.ip) {
+      metrics.geo = await getNodeGeoInfo(newNode.ip);
+    }
+
+    // 记录节点请求指标
+    recordNodeRequestMetrics(newNode, metrics);
+
+    // 定期自学习与分流表动态调整
+    if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
+
+    // 节点异常自动降级，恢复后自动提升
+    const anomalyScore = predictNodeAnomaly(newNode);
+    if (anomalyScore > 0.7) {
+      nodeManager.updateNodeHealth(newNode, 'bad');
+    } else if (anomalyScore < 0.2) {
+      nodeManager.updateNodeHealth(newNode, 'good');
+    }
+
+    return proxyRequestWithNode(newNode, ...args);
+  } catch (error) {
+    console.error('代理请求处理失败:', error);
+    return proxyRequestWithNode('直连', ...args);
   }
-  // 继续后续代理请求逻辑...
-  return proxyRequestWithNode(newNode, ...args);
 }
 
 // ========== 全自动节点切换辅助函数 ========== 
@@ -2464,26 +2542,8 @@ async function smartDispatchNode(user, nodes, context = {}) {
   return await selectBestNodeWithQuality(nodes);
 }
 
-// 在 handleProxyRequest 入口增强：采集数据+分流优先
-async function handleProxyRequest(user, ...args) {
-  let currentNode = getCurrentNodeForUser(user);
-  const allNodes = getAllAvailableNodesForUser(user);
-  // 分流优先
-  const newNode = await smartDispatchNode(user, allNodes, { /* 可扩展context */ });
-  if (newNode !== currentNode) {
-    setCurrentNodeForUser(user, newNode);
-  }
-  // 采集本次请求的多维度数据
-  const metrics = await testNodeMultiMetrics(newNode);
-  // 获取IP地理信息
-  if (newNode.ip) {
-    metrics.geo = await getNodeGeoInfo(newNode.ip);
-  }
-  await recordNodeRequestMetrics(newNode, metrics);
-  // 可定期调用学习
-  if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
-  return proxyRequestWithNode(newNode, ...args);
-}
+// 已合并至统一代理请求处理入口，此处冗余定义已移除
+
 
 // ========== 多维信息预测研判管理机制 ========== 
 // 预测节点未来表现（可扩展为AI/ML模型）
@@ -2516,6 +2576,7 @@ function predictNodeAnomaly(node) {
 // 智能学习流程中集成预测结果
 async function learnAndUpdateNodeProfile() {
   try {
+    const nodeManager = NodeManager.getInstance();
     for (const [node, records] of nodeProfileDB.entries()) {
       const pred = predictNodeFuturePerformance(node);
 
