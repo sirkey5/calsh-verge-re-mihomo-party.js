@@ -3,26 +3,7 @@
 // 如有跨文件依赖，需在本文件顶部或相关位置补充声明或导入。
 // ===================================
 
-class AppState {
-  static THRESHOLDS = Object.freeze({
-    QUARANTINE: 0.5,
-    BASE_QUARANTINE_DURATION: 24 * 60 * 60 * 1000,
-    
-    NODE_EXPIRE_TIME: 30 * 24 * 60 * 60 * 1000,
-    NODE_INACTIVE_TIME: 7 * 24 * 60 * 60 * 1000,
-    QUARANTINE_EXIT_SCORE: 0.7 // Added: Score threshold to exit quarantine
-  });
-
-  static nodes = Object.freeze({
-    qualityStatus: new Map(),
-    lastSwitch: new Map(),
-    switchCooldown: new Map(),
-    qualityScore: new Map(),
-    nextEvalTime: new Map(),
-    metrics: new Map(),
-    thresholds: new Map()
-  });
-}
+// AppState类已整合至CentralManager，此处已移除
 
 class RollingStats {
   constructor() {
@@ -103,6 +84,13 @@ class CentralManager {
   constructor() {
     this.manager = CentralManager.instance;
     this.currentPremiumNode = null; // Explicitly initialize current premium node
+    this.switchCooldown = new Map(); // 迁移自AppState.nodes.switchCooldown
+    this.thresholds = new Map(); // 迁移自AppState.nodes.thresholds
+    this.thresholds.set('minQualityScore', 0.65); // 设置默认质量阈值
+    this.thresholds.set('quarantine', 0.5); // 迁移自AppState.THRESHOLDS.QUARANTINE
+    this.thresholds.set('baseQuarantineDuration', 24 * 60 * 60 * 1000); // 迁移自AppState.THRESHOLDS.BASE_QUARANTINE_DURATION
+    this.thresholds.set('quarantineExitScore', 0.7); // 迁移自AppState.THRESHOLDS.QUARANTINE_EXIT_SCORE
+    this.indexSwitchCooldown = new Map(); // 迁移自AppState.nodeSwitchCooldown
     this.connectionPool = { // Mock connection pool
       hasIdleConnections: () => false, // Placeholder
       releaseFailedConnection: (url) => console.log(`[ConnectionPool] Released connection for ${url} (mock)`) // Placeholder
@@ -464,7 +452,7 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     this.failureCounts.set(url, newFailures);
     console.log(`[CentralManager._handleFailure] Updated failure count for ${url} to ${newFailures}`);
 
-    const quarantineThreshold = 5; // Default, consider adding to AppState.THRESHOLDS
+    const quarantineThreshold = this.thresholds.get('quarantineThreshold') || 5; // 迁移自AppState.THRESHOLDS相关配置
     if (newFailures > quarantineThreshold) {
       console.warn(`[CentralManager._handleFailure] Node ${url} has failed ${newFailures} times. Quarantining.`);
       this.quarantinedNodes.add(url);
@@ -491,7 +479,7 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     this.failureCounts.set(url, 0);
     
     // It might also be prudent to set a cooldown for the newly activated CDN to prevent immediate re-evaluation or flapping.
-    // Example: AppState.nodes.switchCooldown.set(newActiveCDN, Date.now() + 60000); // 1 minute cooldown
+    // 已迁移至CentralManager.switchCooldown
 
     return true; // Indicate rotation occurred
   }
@@ -527,7 +515,7 @@ const dynamicAlpha = Math.min(0.35, Math.max(0.15,
     nodeStat.needsReview = true;
     nodeStat.reviewScheduledAt = Date.now();
     // Example: Set a flag for manual intervention or a very long automated re-evaluation period.
-    // nodeStat.nextAutomatedReviewTime = Date.now() + (AppState.THRESHOLDS.NODE_EXPIRE_TIME || 30 * 24 * 60 * 60 * 1000);
+    // 已迁移至CentralManager.thresholds.get('nodeExpireTime')
     this.nodeStats.set(url, nodeStat);
     console.log(`[Node Review] ${url} marked for review. Stats updated:`, nodeStat);
   }
@@ -602,7 +590,7 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     if (this.currentPremiumNode && !this.quarantinedNodes.has(this.currentPremiumNode.url)) {
         const premiumScore = this._calculateStabilityScore(this.currentPremiumNode.url);
         // Add a bias for the premium node if its score is still good
-        if (premiumScore > (AppState.THRESHOLDS.QUARANTINE || 0.5) * 1.2) { // e.g., 20% above quarantine threshold
+        if (premiumScore > this.thresholds.get('quarantine') * 1.2) { // e.g., 20% above quarantine threshold
             // console.log(`[CentralManager.getBestNode] Prioritizing premium node ${this.currentPremiumNode.url} with score ${premiumScore.toFixed(3)}`);
             return this.currentPremiumNode.url;
         }
@@ -616,7 +604,7 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
       }
 
       // Check if node is on cooldown for switching
-      const cooldownEndTime = AppState.nodes.switchCooldown.get(nodeUrl);
+      const cooldownEndTime = this.switchCooldown.get(nodeUrl);
       if (cooldownEndTime && Date.now() < cooldownEndTime) {
         // console.log(`[CentralManager.getBestNode] Node ${nodeUrl} is on switch cooldown. Skipping.`);
         continue;
@@ -695,7 +683,7 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     const failureThreshold = Math.max(3, Math.floor(2 / Math.max(0.1, stabilityScore))); // Inverse relationship with stability score for threshold
 
     if (failures + 1 >= failureThreshold) { 
-      if (stabilityScore < (AppState.THRESHOLDS.QUARANTINE || 0.5)) {
+      if (stabilityScore < this.thresholds.get('quarantine')) {
         // 稳定性评分低于隔离阈值，则隔离节点并安排审查。
         this._quarantineNode(url);
         this._scheduleNodeReview(url); // Schedule for long-term review
@@ -707,7 +695,7 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
         
         // Cooldown for the *newly selected* activeIndex to prevent immediate switch-back or rapid cycling
         const switchCooldownDuration = baseCooldown * (1 + (1 - this._calculateStabilityScore(this.cdnPool[this.activeIndex])) * 3); // Cooldown based on new node's stability
-        AppState.nodes.switchCooldown.set(this.cdnPool[this.activeIndex], Date.now() + switchCooldownDuration);
+        this.switchCooldown.set(this.cdnPool[this.activeIndex], Date.now() + switchCooldownDuration);
       }
     }
     return false;
@@ -729,13 +717,13 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     const stabilityScore = this._calculateStabilityScore(url);
     
 
-    const baseQuarantineDuration = (AppState.THRESHOLDS.BASE_QUARANTINE_DURATION || (24 * 60 * 60 * 1000));
+    const baseQuarantineDuration = this.thresholds.get('baseQuarantineDuration');
     const quarantineDuration = baseQuarantineDuration * Math.max(0.1, (1 - stabilityScore)); // Ensure some minimum duration factor
 
     // 设置定时器，在隔离期满后检查节点是否恢复，若恢复则移出隔离区。
     const timer = setTimeout(() => {
       // Re-calculate score at the end of quarantine
-      if (this._calculateStabilityScore(url) > (AppState.THRESHOLDS.QUARANTINE_EXIT_SCORE || 0.7)) { // Use a configurable exit score
+      if (this._calculateStabilityScore(url) > this.thresholds.get('quarantineExitScore')) { // Use a configurable exit score
         this.quarantinedNodes.delete(url);
         const currentStat = this.nodeStats.get(url);
         if (currentStat) {
@@ -965,17 +953,17 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     // 严格遵循qualityScore阈值
     const currentCDN = this.getCurrentCDN();
     const currentScore = this._calculateStabilityScore(currentCDN);
-    const minQualityScore = AppState.nodes.thresholds.get('minQualityScore') ?? 0.65;
+    const minQualityScore = this.thresholds.get('minQualityScore');
 
     if (currentScore < minQualityScore) {
       this.activeIndex = (this.activeIndex + 1) % this.cdnPool.length;
-      AppState.nodeSwitchCooldown.set(this.activeIndex, Date.now());
+      this.indexSwitchCooldown.set(this.activeIndex, Date.now());
       return;
     }
 
     // 新增冷却时间检查（30分钟内不重复切换）
-    if (AppState.nodeSwitchCooldown.has(this.activeIndex) &&
-      Date.now() - AppState.nodeSwitchCooldown.get(this.activeIndex) < 1800000) {
+    if (this.indexSwitchCooldown.has(this.activeIndex) &&
+      Date.now() - this.indexSwitchCooldown.get(this.activeIndex) < 1800000) {
       return;
     }
 
@@ -998,7 +986,7 @@ const timeDecayFactor = Math.pow(0.5, (Date.now() - (stats.lastAccessTime || Dat
     const currentSourceScore = this._calculateStabilityScore(currentCDN);
     if (bestIndex !== this.activeIndex && (bestScore > currentSourceScore * 1.1 || currentSourceScore < 0.7)) {
       this.activeIndex = bestIndex;
-      AppState.nodeSwitchCooldown.set(bestIndex, Date.now());
+      this.indexSwitchCooldown.set(bestIndex, Date.now());
     }
   }
 }
@@ -1427,9 +1415,7 @@ const dnsConfig = {
     '+.ocsp.usertrust.com',   // 证书状态
     '+.pki-goog.l.google.com', // Google证书服务
 
-  '+.corp.example.com', // 补充企业内网域名
-  '+.vpn.local',
-  '*.internal'
+
   ]
 }
 
@@ -1442,12 +1428,13 @@ const ruleProviderCommon = {
 
 // 代理组通用配置
 const groupBaseOption = {
-  interval: 300,
   timeout: 5000,
   url: 'https://cp.cloudflare.com/generate_204',  // 使用HTTPS进行健康检查
   lazy: true,
   'max-failed-times': 3,
   'health-check': {
+    interval: 300,       // 检测间隔统一为300秒（原外层interval移此）
+    timeout: 2000,      // 超时2秒
     enable: true,
     interval: 30,       // 检测间隔30秒
     timeout: 2000,      // 超时2秒
@@ -1509,26 +1496,118 @@ const rules = [
   'DOMAIN-SUFFIX,douyin.com,DIRECT',   // douyin.com直连
 ]
 
-const multiplierCache = new Map();
+// 统一缓存管理器：集中管理所有节点相关缓存
+class NodeCacheManager {
+  constructor() {
+    this.caches = new Map();
+    // 初始化所有缓存及其配置
+    this.initCache('multiplier', { maxSize: 100, ttl: 3600000 }); // 1小时TTL
+    this.initCache('jitter', { maxSize: 500, ttl: 300000 }); // 5分钟TTL
+    this.initCache('loss', { maxSize: 500, ttl: 300000 });
+    this.initCache('history', { maxSize: 500, ttl: 86400000 }); // 24小时TTL
+    this.initCache('lastSwitch', { maxSize: 500, ttl: 0 }); // 无过期
+    // 启动定期清理
+    this.startCleanupInterval();
+  }
+
+  // 初始化缓存
+  initCache(name, { maxSize, ttl }) {
+    this.caches.set(name, {
+      data: new Map(),
+      maxSize,
+      ttl,
+      lastCleanup: Date.now()
+    });
+  }
+
+  // 获取缓存
+  get(name, key) {
+    const cache = this.caches.get(name);
+    if (!cache) return undefined;
+
+    const entry = cache.data.get(key);
+    if (!entry) return undefined;
+
+    // 检查TTL
+    if (cache.ttl > 0 && Date.now() - entry.timestamp > cache.ttl) {
+      cache.data.delete(key);
+      return undefined;
+    }
+
+    return entry.value;
+  }
+
+  // 设置缓存
+  set(name, key, value) {
+    const cache = this.caches.get(name);
+    if (!cache) return false;
+
+    // 检查大小限制
+    if (cache.data.size >= cache.maxSize) {
+      // LRU淘汰策略 - 删除最早的条目
+      const oldestKey = Array.from(cache.data.keys()).shift();
+      cache.data.delete(oldestKey);
+    }
+
+    cache.data.set(key, {
+      value,
+      timestamp: Date.now()
+    });
+    return true;
+  }
+
+  // 定期清理过期项
+  cleanupExpired() {
+    const now = Date.now();
+    this.caches.forEach((cache, name) => {
+      if (cache.ttl <= 0) return;
+
+      // 每5分钟清理一次
+      if (now - cache.lastCleanup < 300000) return;
+
+      let deleted = 0;
+      Array.from(cache.data.entries()).forEach(([key, entry]) => {
+        if (now - entry.timestamp > cache.ttl) {
+          cache.data.delete(key);
+          deleted++;
+        }
+      });
+      cache.lastCleanup = now;
+      if (deleted > 0) {
+        console.log(`Cache ${name} cleaned up ${deleted} expired entries`);
+      }
+    });
+  }
+
+  // 启动清理定时器
+  startCleanupInterval() {
+    setInterval(() => this.cleanupExpired(), 60000); // 每分钟检查一次
+  }
+}
+
+// 初始化缓存管理器单例
+const cacheManager = new NodeCacheManager();
+
+// 倍率获取函数（使用缓存管理器）
 const getMultiplier = (name) => {
-  if (multiplierCache.has(name)) return multiplierCache.get(name);
+  // 尝试从缓存获取
+  let result = cacheManager.get('multiplier', name);
+  if (result !== undefined) return result;
+
+  // 缓存未命中，计算并缓存结果
   const match = name.match(/(?<=[xX✕✖⨉倍率])[0-9]+\.?[0-9]*(?=[xX✕✖⨉倍率])/);
-  const result = match ? parseFloat(match[0]) : 0; // 优化正则表达式匹配逻辑，提高效率和准确性
-  multiplierCache.set(name, result);
+  result = match ? parseFloat(match[0]) : 0;
+  cacheManager.set('multiplier', name, result);
   return result;
 };
 
-// 节点多维度健康状态缓存
-const nodeJitterCache = new Map();
-const nodeLossCache = new Map();
-const nodeHistoryCache = new Map();
-const nodeLastSwitch = new Map();
+// 节点多维度健康状态缓存现在通过cacheManager访问
 
 // 多维度测速与健康检测
 async function testNodeMultiMetrics(node) {
   let latency = Infinity, jitter = 0, loss = 0, bandwidth = 0;
   const results = [];
-  const testCount = 5;
+  const testCount = node.stabilityScore > 0.8 ? 3 : 5; // 稳定节点减少测试次数
   let success = 0;
   for (let i = 0; i < testCount; i++) {
     const start = Date.now();
@@ -1546,16 +1625,19 @@ async function testNodeMultiMetrics(node) {
     latency = valid.reduce((a, b) => a + b, 0) / valid.length;
     jitter = valid.length > 1 ? Math.sqrt(valid.map(x => Math.pow(x - latency, 2)).reduce((a, b) => a + b, 0) / valid.length) : 0;
     loss = 1 - (success / testCount);
-    // 模拟带宽（可扩展为真实测速）
-    bandwidth = 1000 / (latency || 1);
+    // 真实带宽测试（下载1MB文件）
+    const startDownload = Date.now();
+    await fetch('https://example.com/1mb-test-file');
+    const downloadTime = (Date.now() - startDownload) / 1000; // 秒
+    bandwidth = downloadTime > 0 ? 1024 / downloadTime : 0; // MB/s
   }
-  nodeJitterCache.set(node, jitter);
-  nodeLossCache.set(node, loss);
+  cacheManager.set('jitter', node, jitter);
+  cacheManager.set('loss', node, loss);
   // 维护历史表现滑动窗口
-  let history = nodeHistoryCache.get(node) || [];
+  let history = cacheManager.get('history', node) || [];
   history.push(loss < 0.2 && latency < 500 ? 1 : 0);
   if (history.length > 20) history = history.slice(-20);
-  nodeHistoryCache.set(node, history.reduce((a, b) => a + b, 0) / history.length);
+  cacheManager.set('history', node, history.reduce((a, b) => a + b, 0) / history.length);
   return { latency, jitter, loss, bandwidth };
 }
 
@@ -1569,6 +1651,8 @@ function groupNodesByGeo(nodes, geoInfoMap) {
 
 // =================== 批量并发分组与优选（增强版） =================== 
 async function batchGroupAndSelect(nodes, geoInfoMap, historyCache) {
+  // 统一通过CentralManager调用
+  return CentralManager.instance.batchGroupAndSelect(nodes, geoInfoMap, historyCache);
   // 地理聚类分组
   const groups = groupNodesByGeo(nodes, geoInfoMap);
   // 每组内并发优选，优先优质节点
@@ -1591,12 +1675,62 @@ async function batchGroupAndSelect(nodes, geoInfoMap, historyCache) {
 }
 
 // =================== 批量并发测速与健康检查 =================== 
-async function batchTestNodes(nodes) {
-  // 并发测速与健康检查，返回所有节点的多维度指标
-  return await Promise.all(nodes.map(async node => {
-    const metrics = await testNodeMultiMetrics(node);
-    return { node, ...metrics };
-  }));
+async function batchTestNodes(nodes, concurrency = 5) {
+  // 优化：使用信号量控制并发，增加超时处理
+  const results = [];
+  const semaphore = new Semaphore(concurrency);
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => timeoutController.abort(), 30000); // 30秒超时
+
+  try {
+    const promises = nodes.map(async (node) => {
+      const release = await semaphore.acquire();
+      try {
+        const metrics = await Promise.race([
+          testNodeMultiMetrics(node),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('节点测试超时')), 15000))
+        ]);
+        return { node, ...metrics, status: 'success' };
+      } catch (error) {
+        console.error(`节点 ${node} 测试失败:`, error);
+        return { node, status: 'failed', error: error.message };
+      } finally {
+        release();
+      }
+    });
+
+    const allResults = await Promise.all(promises);
+    results.push(...allResults.filter(r => r.status === 'success'));
+    return results;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// 简易信号量实现
+class Semaphore {
+  constructor(limit) {
+    this.limit = limit;
+    this.count = 0;
+    this.queue = [];
+  }
+
+  async acquire() {
+    if (this.count < this.limit) {
+      this.count++;
+      return () => this.release();
+    }
+
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+
+  release() {
+    this.count--;
+    if (this.queue.length > 0) {
+      const resolve = this.queue.shift();
+      resolve(() => this.release());
+    }
+  }
 }
 
 // =================== 节点分流分配（增强版） =================== 
@@ -1662,30 +1796,7 @@ function aiScoreNode({ latency, jitter, loss, bandwidth, history }) {
 
 // ========== 多维信息AI/ML预测与评分核心 ========== 
 // 多特征线性回归预测节点未来表现
-function predictNodeFuturePerformance(node) {
-  const records = nodeProfileDB.get(node) || [];
-  if (records.length < 5) return { expectedLatency: 9999, expectedLoss: 1, risk: 1 };
-  const recent = records.slice(-20);
-  // 多特征线性回归（延迟、丢包、带宽、历史分数）
-  let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-  for (let i = 0; i < recent.length; i++) {
-    const x = i;
-    const y = (recent[i].latency || 0) + (recent[i].loss || 0) * 1000 - (recent[i].bandwidth || 0) * 10 - (recent[i].history || 0) * 100;
-    sumX += x; sumY += y; sumXY += x * y; sumXX += x * x;
-  }
-  const n = recent.length;
-  const slope = n * sumXY - sumX * sumY ? (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX) : 0;
-  const intercept = (sumY - slope * sumX) / n;
-  // 预测下一个周期的表现
-  const predLatency = intercept + slope * n;
-  const avgLoss = recent.reduce((a, b) => a + (b.loss || 0), 0) / n;
-  const risk = Math.min(1, Math.max(0, avgLoss + (slope > 0 ? 0.2 : 0)));
-  return {
-    expectedLatency: predLatency,
-    expectedLoss: avgLoss,
-    risk
-  };
-}
+// 已整合到CentralManager中，此处移除重复定义
 
 // 节点异常概率预测
 function predictNodeAnomaly(node) {
@@ -1822,7 +1933,7 @@ async function main(config) {
 
   const allNodes = config.proxies.map(b => b.name);
   await periodicEvaluateAllNodes(allNodes);
-  await preheatAndRefreshNodes(allNodes, nodeHistoryCache);
+  await preheatAndRefreshNodes(allNodes, cacheManager);
 
   for (const region of regionOptions.regions) {
     /**
@@ -1889,12 +2000,12 @@ async function main(config) {
 
   for (const group of regionProxyGroups) {
     if (group.proxies && group.proxies.length > 1) {
-      const best = await batchGroupAndSelect(group.proxies, {}, nodeHistoryCache);
+      const best = await batchGroupAndSelect(group.proxies, {}, cacheManager);
       group.proxies = [best[0], ...group.proxies.filter(n => n !== best[0])];
     }
   }
   if (otherProxyGroups.length > 1) {
-    const best = await batchGroupAndSelect(otherProxyGroups, {}, nodeHistoryCache);
+    const best = await batchGroupAndSelect(otherProxyGroups, {}, cacheManager);
     otherProxyGroups = [best[0], ...otherProxyGroups.filter(n => n !== best[0])];
   }
 
@@ -2433,8 +2544,8 @@ async function handleProxyRequest(user, ...args) {
 
 // ========== 全自动节点切换辅助函数 ========== 
 async function autoUpdateCurrentNode(allNodes) {
-  const nodeManager = NodeManager.getInstance();
-  const newNode = await nodeManager.coordinatedSwitch(currentNode, allNodes, 'scheduled_update');
+  const manager = CentralManager.instance;
+  const newNode = await manager.coordinatedSwitch(currentNode, allNodes, 'scheduled_update');
   if (newNode !== currentNode) {
     currentNode = newNode;
     // 可选：记录切换日志
@@ -2591,44 +2702,7 @@ async function learnAndUpdateNodeProfile() {
   }
 }
 
-async function handleProxyRequest(user, req, ...args) {
-  let currentNode = nodeManager.getNodeDispatch(user);
-  const allNodes = getAllAvailableNodesForUser(user);
-
-  // 获取客户端IP地址
-  const clientIP = req.headers.get('X-Forwarded-For') || req.headers.get('Remote-Address');
-
-  // 获取客户端IP的地理信息
-  const clientGeo = await getNodeGeoInfo(clientIP);
-
-  // 分流优先，AI预测驱动
-  const newNode = await smartDispatchNode(user, allNodes, { clientGeo });
-
-  if (newNode !== currentNode) {
-    nodeManager.updateNodeDispatch(user, newNode);
-  }
-
-  // 采集本次请求的多维度数据
-  const metrics = await testNodeMultiMetrics(newNode);
-  if (newNode.ip) {
-    metrics.geo = await getNodeGeoInfo(newNode.ip);
-  }
-
-  // 记录节点请求指标
-  recordNodeRequestMetrics(newNode, metrics);
-
-  // 定期自学习与分流表动态调整
-  if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
-
-  // 节点异常自动降级，恢复后自动提升
-  if (predictNodeAnomaly(newNode) > 0.7) {
-    nodeManager.updateNodeHealth(newNode, 'bad');
-  } else if (predictNodeAnomaly(newNode) < 0.2) {
-    nodeManager.updateNodeHealth(newNode, 'good');
-  }
-
-  return proxyRequestWithNode(newNode, ...args);
-}
+// 已整合到下方优化实现中，此处移除重复定义
 
 async function smartDispatchNode(user, nodes, context = {}) {
   const key = context.userKey || user;
@@ -2651,51 +2725,7 @@ async function smartDispatchNode(user, nodes, context = {}) {
 }
 
 // ========== 节点全自动切换与分流主流程优化 ==========
-async function handleProxyRequest(user, ...args) {
-  try {
-    const nodeManager = NodeManager.getInstance();
-    let currentNode = nodeManager.getNodeDispatch(user);
-    const allNodes = getAllAvailableNodesForUser(user);
-
-    // 客户端地理信息采集
-    const clientIP = req.headers.get('X-Forwarded-For') || req.headers.get('Remote-Address');
-    const clientGeo = await getNodeGeoInfo(clientIP);
-
-    // 分流优先，AI预测驱动
-    const newNode = await smartDispatchNode(user, allNodes, { clientGeo });
-
-    // 协调切换
-    if (newNode !== currentNode) {
-      await nodeManager.coordinatedSwitch(currentNode, allNodes, 'traffic_based');
-      currentNode = nodeManager.getNodeDispatch(user);
-    }
-
-    // 采集本次请求的多维度数据
-    const metrics = await testNodeMultiMetrics(newNode);
-    if (newNode.ip) {
-      metrics.geo = await getNodeGeoInfo(newNode.ip);
-    }
-
-    // 记录节点请求指标
-    recordNodeRequestMetrics(newNode, metrics);
-
-    // 定期自学习与分流表动态调整
-    if (Math.random() < 0.01) await learnAndUpdateNodeProfile();
-
-    // 节点异常自动降级，恢复后自动提升
-    const anomalyScore = predictNodeAnomaly(newNode);
-    if (anomalyScore > 0.7) {
-      nodeManager.updateNodeHealth(newNode, 'bad');
-    } else if (anomalyScore < 0.2) {
-      nodeManager.updateNodeHealth(newNode, 'good');
-    }
-
-    return proxyRequestWithNode(newNode, ...args);
-  } catch (error) {
-    console.error('代理请求处理失败:', error);
-    return proxyRequestWithNode('直连', ...args);
-  }
-}
+// 已整合到下方优化实现中，此处移除重复定义
 
 // Define the onGenerate function for singbox configuration mixing
 const onGenerate = async (config) => {
@@ -2733,65 +2763,61 @@ const onGenerate = async (config) => {
 // ========== AI数据持久化与六维淘汰机制增强（兼容SubStore/浏览器） ========== 
 const AI_DB_KEY = 'ai_node_data';
 
-function isSubStore() {
+CentralManager.prototype.isSubStore = function() {
   return typeof $persistentStore !== 'undefined';
-}
-function isBrowser() {
-  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
-}
+};
 
-// 加载AI数据
-function loadAIDBFromFile() {
+CentralManager.prototype.isBrowser = function() {
+  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+};
+
+// AI数据管理方法整合到CentralManager
+CentralManager.prototype.loadAIDB = function() {
   try {
     let raw = '';
-    if (isSubStore()) {
+    if (this.isSubStore()) {
       raw = $persistentStore.read(AI_DB_KEY) || '';
-    } else if (isBrowser()) {
+    } else if (this.isBrowser()) {
       raw = window.localStorage.getItem(AI_DB_KEY) || '';
     }
     if (raw) {
       const obj = JSON.parse(raw);
-      for (const [k, v] of Object.entries(obj)) nodeProfileDB.set(k, v);
+      for (const [k, v] of Object.entries(obj)) this.nodeProfileDB.set(k, v);
     }
   } catch (e) { console.error('AI数据加载失败', e); }
-}
+};
 
-// 保存AI数据
-function saveAIDBToFile() {
+CentralManager.prototype.saveAIDB = function() {
   try {
     const obj = {};
-    for (const [k, v] of nodeProfileDB.entries()) obj[k] = v;
+    for (const [k, v] of this.nodeProfileDB.entries()) obj[k] = v;
     const raw = JSON.stringify(obj, null, 2);
-    if (isSubStore()) {
+    if (this.isSubStore()) {
       $persistentStore.write(raw, AI_DB_KEY);
-    } else if (isBrowser()) {
+    } else if (this.isBrowser()) {
       window.localStorage.setItem(AI_DB_KEY, raw);
     }
   } catch (e) { console.error('AI数据保存失败', e); }
-}
+};
 
-// 六维度淘汰机制
-function autoEliminateAIDB() {
-  for (const [node, records] of nodeProfileDB.entries()) {
-    const pred = predictNodeFuturePerformance(node);
-    if (pred.risk > 0.95) { nodeProfileDB.delete(node); continue; }
+CentralManager.prototype.autoEliminateAIDB = function() {
+  for (const [node, records] of this.nodeProfileDB.entries()) {
+    const pred = this.predictNodeFuturePerformance(node);
+    if (pred.risk > 0.95) { this.nodeProfileDB.delete(node); continue; }
     const avgScore = records.reduce((a, b) => a + (b.aiScore || 0), 0) / (records.length || 1);
-    if (avgScore < -500) { nodeProfileDB.delete(node); continue; }
+    if (avgScore < -500) { this.nodeProfileDB.delete(node); continue; }
     const latencies = records.map(r => r.latency).filter(Boolean);
     if (latencies.length > 10) {
       const mean = latencies.reduce((a, b) => a + b, 0) / latencies.length;
       const variance = latencies.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / latencies.length;
-      if (variance > 1000000) { nodeProfileDB.delete(node); continue; }
+      if (variance > 1000000) { this.nodeProfileDB.delete(node); continue; }
     }
     if (records.slice(-5).filter(r => r.loss > 0.5 || r.latency > 2000).length >= 5) {
-      nodeProfileDB.delete(node); continue;
+      this.nodeProfileDB.delete(node); continue;
     }
   }
-  saveAIDBToFile();
-}
-
-// 启动时自动加载
-loadAIDBFromFile();
+  this.saveAIDB();
+};
 
 // 在采集、学习、请求等流程中自动持久化和淘汰
 const _oldRecordNodeRequestMetrics = recordNodeRequestMetrics;
@@ -2807,270 +2833,236 @@ learnAndUpdateNodeProfile = async function() {
   saveAIDBToFile();
 };
 
-// 修改点1：统一节点切换管理器
-const userNodeMap = new Map();
+// 节点管理功能整合到CentralManager
+CentralManager.prototype.getNodeDispatch = function(user) {
+  const latestKey = Array.from(this.nodeDispatchTable.keys())
+    .filter(key => key.startsWith(user))
+    .sort()
+    .pop();
+  return latestKey ? this.nodeDispatchTable.get(latestKey) : null;
+};
 
-class NodeManager {
-  setCurrentNodeForUser(user, node) {
-    userNodeMap.set(user, node);
-    this._updateNodeUsageStats(node);
+CentralManager.prototype.updateNodeHealth = function(node, status) {
+  // 实现节点健康状态更新逻辑
+  this.nodeQualityStatus.set(node, status);
+  if (status === 'bad') {
+    this.nodeQualityScore.set(node, Math.min(-3, this.nodeQualityScore.get(node) || 0 - 2));
+  } else if (status === 'good') {
+    this.nodeQualityScore.set(node, Math.max(3, this.nodeQualityScore.get(node) || 0 + 2));
   }
-  constructor() {
-    this.currentPremiumNode = null; // 当前优质节点标记
-    this.currentNode = null;
-    this.nodeSwitchCooldown = new Map();
-    this.BASE_SWITCH_COOLDOWN = 30 * 60 * 1000;
-    this.MAX_SWITCH_COOLDOWN = 24 * 60 * 60 * 1000;
-    this.switchHistory = [];
-    this.HISTORY_WINDOW = 7 * 24 * 60 * 60 * 1000; // 保留7天历史
-  }
+};
 
-  // 单例模式
-  static getInstance() {
-    if (!NodeManager.instance) {
-      NodeManager.instance = new NodeManager();
-    }
-    return NodeManager.instance;
-  }
+CentralManager.prototype.initNodeManagement = function() {
+  this.userNodeMap = new Map();
+  this.currentPremiumNode = null;
+  this.currentNode = null;
+  this.nodeSwitchCooldown = new Map();
+  this.BASE_SWITCH_COOLDOWN = 30 * 60 * 1000;
+  this.MAX_SWITCH_COOLDOWN = 24 * 60 * 60 * 1000;
+  this.switchHistory = [];
+  this.HISTORY_WINDOW = 7 * 24 * 60 * 60 * 1000; // 保留7天历史
+  this.nodeQualityScore = new Map();
+  this.nodeQualityStatus = new Map();
+  this.cdnPool = []; // 初始化CDN池
+  this.activeIndex = 0; // 初始化活动索引
+  this.nodeDispatchTable = new Map(); // 整合全局分流表
+  // 节点历史缓存通过cacheManager管理
+};
 
-  async updateNodeDispatch(user, node) {
-    // 添加版本控制的分流表更新
-    const key = `${user}@${Date.now().toString().slice(0, -3)}`;
-    nodeDispatchTable.set(key, node);
-    this._cleanupOldVersions(user);
-  }
+CentralManager.prototype.setCurrentNodeForUser = function(user, node) {
+  this.userNodeMap.set(user, node);
+  this._updateNodeUsageStats(node);
+};
 
-  _cleanupOldVersions(user) {
-    // 清理旧版本分流记录
-    const now = Date.now();
-    for (const [key, value] of nodeDispatchTable.entries()) {
-      if (key.startsWith(user) && parseInt(key.split('@')[1]) < now - this.HISTORY_WINDOW) {
-        nodeDispatchTable.delete(key);
-      }
-    }
-  }
+CentralManager.prototype.updateNodeDispatch = async function(user, node) {
+  const key = `${user}@${Date.now().toString().slice(0, -3)}`;
+  this.nodeDispatchTable.set(key, node);
+  this._cleanupOldVersions(user);
+};
 
-  recordSwitchEvent(oldNode, newNode, reason) {
-    // 记录切换事件用于后续分析
-    this.switchHistory.push({
-      timestamp: Date.now(),
-      oldNode,
-      newNode,
-      reason,
-      riskLevel: this.calculateRiskLevel(oldNode, newNode)
-    });
-    this._pruneHistory();
-  }
-
-  calculateRiskLevel(oldNode, newNode) {
-    // 计算切换风险等级
-    if (!oldNode || !newNode) return 0;
-    
-    const oldPred = predictNodeFuturePerformance(oldNode);
-    const newPred = predictNodeFuturePerformance(newNode);
-    
-    return Math.max(
-      0,
-      Math.min(5, Math.floor((newPred.risk - oldPred.risk) / 0.2))
-    );
-  }
-
-  _pruneHistory() {
-    // 保留最近30天的切换记录
-    const now = Date.now();
-    this.switchHistory = this.switchHistory.filter(
-      event => event.timestamp > now - 30 * 24 * 60 * 60 * 1000
-    );
-  }
-
-  async coordinatedSwitch(currentNode, allNodes, triggerReason) {
-    // 协调所有切换机制的统一入口
-    try {
-      // 检查冷却状态
-      if (this._isInCooldown(currentNode)) {
-        return currentNode;
-      }
-
-      // 获取健康节点
-      const healthyNodes = await this._filterHealthyNodes(allNodes);
-      
-      // 获取最优节点
-      const bestNode = await this._getOptimalNode(healthyNodes, currentNode);
-      
-      // 检查是否需要切换
-      if (await this._shouldSwitch(currentNode, bestNode)) {
-        const cooldown = this._calculateCooldown(bestNode);
-        this._applyNodeSwitch(currentNode, bestNode, cooldown, triggerReason);
-        return bestNode;
-      }
-      
-      return currentNode;
-    } catch (error) {
-      console.error('节点切换协调失败:', error);
-      return this._fallbackStrategy(currentNode, allNodes);
+CentralManager.prototype._cleanupOldVersions = function(user) {
+  const now = Date.now();
+  for (const [key, value] of this.nodeDispatchTable.entries()) {
+    if (key.startsWith(user) && parseInt(key.split('@')[1]) < now - this.HISTORY_WINDOW) {
+      this.nodeDispatchTable.delete(key);
     }
   }
+};
 
-  // Method to get the best node URL (to be implemented)
-  async getBestNode() {
-    // This is a placeholder. The actual logic will involve:
-    // 1. Getting a list of available nodes/CDNs.
-    // 2. Performing health checks on a subset or all of them.
-    // 3. Calculating stability scores.
-    // 4. Selecting the best node based on scores, quarantine status, cooldowns, etc.
-    // For now, just return the current active CDN URL.
-    console.log(`[getBestNode] Returning current active CDN: ${this.cdnPool[this.activeIndex]}`);
-    return this.cdnPool[this.activeIndex];
-  }
+CentralManager.prototype.recordSwitchEvent = function(oldNode, newNode, reason) {
+  this.switchHistory.push({
+    timestamp: Date.now(),
+    oldNode,
+    newNode,
+    reason,
+    riskLevel: this.calculateRiskLevel(oldNode, newNode)
+  });
+  this._pruneHistory();
+};
 
-  // Method to get the best node URL (to be implemented)
-  async getBestNode() {
-    // This is a placeholder. The actual logic will involve:
-    // 1. Getting a list of available nodes/CDNs.
-    // 2. Performing health checks on a subset or all of them.
-    // 3. Calculating stability scores.
-    // 4. Selecting the best node based on scores, quarantine status, cooldowns, etc.
-    // For now, just return the current active CDN URL.
-    console.log(`[getBestNode] Returning current active CDN: ${this.cdnPool[this.activeIndex]}`);
-    return this.cdnPool[this.activeIndex];
-  }
+CentralManager.prototype.calculateRiskLevel = function(oldNode, newNode) {
+  if (!oldNode || !newNode) return 0;
+  
+  const oldPred = this.predictNodeFuturePerformance(oldNode);
+  const newPred = this.predictNodeFuturePerformance(newNode);
+  
+  return Math.max(
+    0,
+    Math.min(5, Math.floor((newPred.risk - oldPred.risk) / 0.2))
+  );
+};
 
-  _isInCooldown(node) {
-    // 综合判断是否在冷却期
-    return !!(this.nodeSwitchCooldown.get(node) && 
-           Date.now() < this.nodeSwitchCooldown.get(node));
-  }
+CentralManager.prototype._pruneHistory = function() {
+  const now = Date.now();
+  this.switchHistory = this.switchHistory.filter(
+    event => event.timestamp > now - 30 * 24 * 60 * 60 * 1000
+  );
+};
 
-  async _filterHealthyNodes(nodes) {
-    // 综合健康检查
-    return nodes.filter(async node => {
-      const metrics = await testNodeMultiMetrics(node);
-      const pred = predictNodeFuturePerformance(node);
-      
-      // 健康标准：风险低于0.8且延迟低于1000ms
-      return pred.risk < 0.8 && metrics.latency < 1000;
-    });
-  }
-
-  async _getOptimalNode(nodes, currentNode) {
-    // 综合评分选择最优节点
-    const candidates = await Promise.all(nodes.map(async node => {
-      const metrics = await testNodeMultiMetrics(node);
-      const pred = predictNodeFuturePerformance(node);
-      
-      // 综合评分公式（平衡各因素）
-      const score = (
-        0.4 * (1 / (metrics.latency || 1)) + 
-        0.3 * (1 - metrics.loss) + 
-        0.2 * (1 - pred.risk) +
-        0.1 * (1 - metrics.jitter / 100)
-      );
-      
-      return { node, score };
-    }));
-    
-    // 按评分排序
-    candidates.sort((a, b) => b.score - a.score);
-    
-    // 如果当前节点在候选列表中且不是最差选择，则保持当前节点
-    if (candidates[0].node !== currentNode && 
-        candidates.some(c => c.node === currentNode) &&
-        candidates.findIndex(c => c.node === currentNode) <= Math.min(2, candidates.length/3)) {
+CentralManager.prototype.coordinatedSwitch = async function(currentNode, allNodes, triggerReason) {
+  try {
+    if (this._isInCooldown(currentNode)) {
       return currentNode;
     }
-    
-    return candidates[0].node;
-  }
 
-  async _shouldSwitch(currentNode, bestNode) {
-    // 综合判断是否需要切换
-    const [currentMetrics, bestMetrics] = await Promise.all([
-      testNodeMultiMetrics(currentNode),
-      testNodeMultiMetrics(bestNode)
-    ]);
+    const healthyNodes = await this._filterHealthyNodes(allNodes);
+    const bestNode = await this._getOptimalNode(healthyNodes, currentNode);
     
-    // 如果当前节点已满足阈值则不切换
-    if (currentMetrics.latency < 300 && currentMetrics.loss < 0.1) {
-      return false;
+    if (await this._shouldSwitch(currentNode, bestNode)) {
+      const cooldown = this._calculateCooldown(bestNode);
+      this._applyNodeSwitch(currentNode, bestNode, cooldown, triggerReason);
+      return bestNode;
     }
     
-    // 如果最佳节点优势不足20%则不切换
-    const improvement = (currentMetrics.latency - bestMetrics.latency) / currentMetrics.latency;
-    return improvement > 0.2;
+    return currentNode;
+  } catch (error) {
+    console.error('节点切换协调失败:', error);
+    return this._fallbackStrategy(currentNode, allNodes);
   }
+};
 
-  _calculateCooldown(node) {
-    // 动态计算冷却时间（优质节点延长，劣质节点缩短）
-    const score = nodeQualityScore.get(node) || 0;
-    let baseCooldown = this.BASE_SWITCH_COOLDOWN;
+CentralManager.prototype._isInCooldown = function(node) {
+  return !!(this.nodeSwitchCooldown.get(node) && 
+         Date.now() < this.nodeSwitchCooldown.get(node));
+};
+
+CentralManager.prototype._filterHealthyNodes = async function(nodes) {
+  return nodes.filter(async node => {
+    const metrics = await this.testNodeMultiMetrics(node);
+    const pred = this.predictNodeFuturePerformance(node);
     
-    // 根据历史表现调整冷却时间
-    if (score > 2) {
-      baseCooldown *= Math.pow(2, Math.min(5, score));
-    } else if (score < -1) {
-      baseCooldown /= 2;
-    }
+    return pred.risk < 0.8 && metrics.latency < 1000;
+  });
+};
+
+CentralManager.prototype._getOptimalNode = async function(nodes, currentNode) {
+  const candidates = await Promise.all(nodes.map(async node => {
+    const metrics = await this.testNodeMultiMetrics(node);
+    const pred = this.predictNodeFuturePerformance(node);
     
-    return Math.min(
-      Math.max(baseCooldown, this.BASE_SWITCH_COOLDOWN/2),
-      this.MAX_SWITCH_COOLDOWN
+    const score = (
+      0.4 * (1 / (metrics.latency || 1)) + 
+      0.3 * (1 - metrics.loss) + 
+      0.2 * (1 - pred.risk) +
+      0.1 * (1 - metrics.jitter / 100)
     );
+    
+    return { node, score };
+  }));
+  
+  candidates.sort((a, b) => b.score - a.score);
+  
+  if (candidates[0].node !== currentNode && 
+      candidates.some(c => c.node === currentNode) &&
+      candidates.findIndex(c => c.node === currentNode) <= Math.min(2, candidates.length/3)) {
+    return currentNode;
   }
+  
+  return candidates[0].node;
+};
 
-  _applyNodeSwitch(oldNode, newNode, cooldown, reason) {
-    // 执行节点切换并更新状态
-    this.nodeSwitchCooldown.set(newNode, Date.now() + cooldown);
-    this.nodeSwitchCooldown.delete(oldNode); // 移除旧节点冷却
-    
-    // 更新节点质量评分
-    this._updateQualityScore(newNode, true);
-    this._updateQualityScore(oldNode, false);
-    
-    // 记录切换事件
-    this.recordSwitchEvent(oldNode, newNode, reason);
-    
-    // 实际切换操作
-    setCurrentNodeForUser(user, newNode);
+CentralManager.prototype._shouldSwitch = async function(currentNode, bestNode) {
+  const [currentMetrics, bestMetrics] = await Promise.all([
+    this.testNodeMultiMetrics(currentNode),
+    this.testNodeMultiMetrics(bestNode)
+  ]);
+  
+  if (currentMetrics.latency < 300 && currentMetrics.loss < 0.1) {
+    return false;
   }
+  
+  const improvement = (currentMetrics.latency - bestMetrics.latency) / currentMetrics.latency;
+  return improvement > 0.2;
+};
 
-  _updateQualityScore(node, isGood) {
-    // 改进质量评分算法
-    const currentScore = nodeQualityScore.get(node) || 0;
-    const delta = isGood ? 1 : -1;
-    const newScore = Math.max(-5, Math.min(5, currentScore + delta));
-    
-    nodeQualityScore.set(node, newScore);
-    nodeQualityStatus.set(node, 
-      newScore > 2 ? 'good' : 
-      newScore < -2 ? 'bad' : 'normal'
-    );
+CentralManager.prototype._calculateCooldown = function(node) {
+  const score = this.nodeQualityScore.get(node) || 0;
+  let baseCooldown = this.BASE_SWITCH_COOLDOWN;
+  
+  if (score > 2) {
+    baseCooldown *= Math.pow(2, Math.min(5, score));
+  } else if (score < -1) {
+    baseCooldown /= 2;
   }
+  
+  return Math.min(
+    Math.max(baseCooldown, this.BASE_SWITCH_COOLDOWN/2),
+    this.MAX_SWITCH_COOLDOWN
+  );
+};
 
-  _fallbackStrategy(currentNode, allNodes) {
-    // 多级降级策略
-    const history = nodeHistoryCache.get(currentNode) || 0;
-    
-    if (history < 0.5) {
-      // 尝试历史优质节点
-      const historyBest = this._getHistoryBest(allNodes);
-      if (historyBest) return historyBest;
-    }
-    
-    // 最后尝试直连
-    return '直连';
-  }
+CentralManager.prototype._applyNodeSwitch = function(oldNode, newNode, cooldown, reason) {
+  this.nodeSwitchCooldown.set(newNode, Date.now() + cooldown);
+  this.nodeSwitchCooldown.delete(oldNode);
+  
+  this._updateQualityScore(newNode, true);
+  this._updateQualityScore(oldNode, false);
+  
+  this.recordSwitchEvent(oldNode, newNode, reason);
+  this.setCurrentNodeForUser(user, newNode);
+};
 
-  _getHistoryBest(nodes) {
-    // 获取历史最优节点
-    const historyScores = nodes.map(node => ({
-      node,
-      history: nodeHistoryCache.get(node) || 0
-    }));
-    
-    historyScores.sort((a, b) => b.history - a.history);
-    return historyScores[0]?.node;
+CentralManager.prototype._updateQualityScore = function(node, isGood) {
+  const currentScore = this.nodeQualityScore.get(node) || 0;
+  const delta = isGood ? 1 : -1;
+  const newScore = Math.max(-5, Math.min(5, currentScore + delta));
+  
+  this.nodeQualityScore.set(node, newScore);
+  this.nodeQualityStatus.set(node, 
+    newScore > 2 ? 'good' : 
+    newScore < -2 ? 'bad' : 'normal'
+  );
+};
+
+CentralManager.prototype._fallbackStrategy = function(currentNode, allNodes) {
+  const history = cacheManager.get('history', currentNode) || 0;
+  
+  if (history < 0.5) {
+    const historyBest = this._getHistoryBest(allNodes);
+    if (historyBest) return historyBest;
   }
-}
+  
+  return '直连';
+};
+
+CentralManager.prototype._getHistoryBest = function(nodes) {
+  const historyScores = nodes.map(node => ({
+    node,
+    history: cacheManager.get('history', node) || 0
+  }));
+  
+  historyScores.sort((a, b) => b.history - a.history);
+  return historyScores[0]?.node;
+};
+
+// 实现getBestNode方法
+CentralManager.prototype.getBestNode = async function() {
+  console.log(`[getBestNode] Returning current active CDN: ${this.cdnPool[this.activeIndex]}`);
+  return this.cdnPool[this.activeIndex];
+};
+
+// 初始化节点管理
+CentralManager.instance.initNodeManagement();
 
 // 修改点2：协调main函数中的自动更新
 async function autoUpdateCurrentNode(allNodes) {
